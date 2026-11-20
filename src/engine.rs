@@ -151,7 +151,6 @@ impl EngineHandle {
             let log_down = state.log.clone();
             let cancel_up = cancel.clone();
             let cancel_down = cancel.clone();
-            let cancel_outer = cancel.clone();
 
             let up_handle = tokio::spawn(async move {
                 run_upload_test(cfg_up, stats_up, log_up, cancel_up).await;
@@ -160,18 +159,9 @@ impl EngineHandle {
                 run_download_test(cfg_down, stats_down, log_down, cancel_down).await;
             });
 
-            // Wait for either outer cancel or both tasks completing; coordinated cleanup
-            tokio::select! {
-                biased;
-                _ = cancel_outer.cancelled() => {
-                    up_handle.abort();
-                    down_handle.abort();
-                }
-                _ = async {
-                    let _ = up_handle.await;
-                    let _ = down_handle.await;
-                } => {}
-            }
+            // Both tasks respect the shared cancel token; joining waits for natural
+            // completion or cancellation without double-moving JoinHandles.
+            let _ = tokio::join!(up_handle, down_handle);
 
             // Ensure both counters are cleared after duplex
             state.stats.up_bps_current.store(0, Ordering::Relaxed);

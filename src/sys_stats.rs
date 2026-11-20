@@ -19,12 +19,12 @@ mod win_imp {
     use std::sync::Mutex;
     use std::time::Instant;
     // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
-    use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
-    use windows::Win32::iphlpapi::{GetTcpStatistics, MIB_TCPSTATS_LH};
+    use windows::Win32::Foundation::NTSTATUS;
+    use windows::Win32::iphlpapi::GetTcpStatistics;
     use windows::Win32::netioapi::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
+    use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
     use windows::Win32::sysinfoapi::GetLocalTime;
-
-    const IF_TYPE_LOOPBACK: u32 = 24;
+    use windows::Win32::tcpmib::MIB_TCPSTATS_LH;
 
     struct NicState {
         last_sample: Instant,
@@ -88,7 +88,7 @@ mod win_imp {
     fn sample_nics() -> (u64, u64, String, u64, u64) {
         let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
         let rc = unsafe { GetIfTable2(&mut table_ptr) };
-        if rc != 0 || table_ptr.is_null() {
+        if rc.0 != 0 || table_ptr.is_null() {
             return (0, 0, "网卡检测中...".to_string(), 0, 0);
         }
 
@@ -101,7 +101,7 @@ mod win_imp {
 
         for i in 0..num {
             let row: &MIB_IF_ROW2 = unsafe { &*table.Table.as_ptr().add(i) };
-            let is_loopback = row.Type == IF_TYPE_LOOPBACK;
+            let is_loopback = row.Type.0 == 24;
             let has_mac = row.PhysicalAddressLength > 0;
             if is_loopback || !has_mac {
                 continue;

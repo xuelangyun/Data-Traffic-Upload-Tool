@@ -1266,7 +1266,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         let y = chart_t + (chart_h * i as i32) / 4 - scale_px(6, theme.dpi);
         let mut tr = RECT { left: scale_px(2, theme.dpi), top: y, right: pad_l - scale_px(2, theme.dpi), bottom: y + scale_px(14, theme.dpi) };
         let wide = to_wide_null(&label);
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_RIGHT | DT_SINGLELINE) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_RIGHT | DT_SINGLELINE) as u32) };
     }
     // X-axis time labels (0s .. 60s)
     for i in 0..=3 {
@@ -1275,11 +1275,11 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         let label = format!("{secs}s");
         let wide = to_wide_null(&label);
         let mut tr = RECT { left: x - scale_px(14, theme.dpi), top: chart_b + scale_px(2, theme.dpi), right: x + scale_px(14, theme.dpi), bottom: chart_b + scale_px(14, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_CENTER | DT_SINGLELINE) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_CENTER | DT_SINGLELINE) as u32) };
     }
 
     // Helper to plot a series
-    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: PEN_STYLE| {
+    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: i32| {
         if points.len() < 2 { return; }
         let pen = unsafe { CreatePen(style, width, color) };
         let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
@@ -1366,7 +1366,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         // text
         let wide = to_wide_null(label);
         let mut tr = RECT { left: bx2 + scale_px(4, theme.dpi), top: ly - scale_px(6, theme.dpi), right: bx2 + scale_px(60, theme.dpi), bottom: ly + scale_px(8, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_LEFT | DT_SINGLELINE) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_LEFT | DT_SINGLELINE) as u32) };
         lx += scale_px(52, theme.dpi);
         if label.len() > 8 { lx += scale_px(20, theme.dpi); }
     }
