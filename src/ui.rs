@@ -625,7 +625,7 @@ fn build_wan_port_rows(
             "MATCH"
         };
         format!(
-            "{port:<5} {interface_text:<39} {expected_egress_ip:<39} {:>4} {:<10}",
+            "{port:<5} {interface_text:<39} {expected_egress_ip:<39} {:>4} {:<11}",
             providers.len(),
             status
         )
@@ -1299,7 +1299,7 @@ impl UiState {
         };
         let wan_map = parse_wan_ip_map(&unsafe { get_text(self.edit_wan_map) });
         let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
-        let configured_ips: Vec<IpAddr> = wan_map.iter().filter_map(|ip| *ip).collect();
+        let configured_ips: Vec<IpAddr> = wan_map.iter().filter_map(|mapping| mapping.expected_egress_ip).collect();
         let unmatched_ips: Vec<String> = wan_samples
             .iter()
             .filter(|(_, ip)| !configured_ips.contains(ip))
@@ -1318,7 +1318,7 @@ impl UiState {
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
         let wan_header_text = format!(
-            "{:<5} {:<39} {:<39} {:>4} {:<10}",
+            "{:<5} {:<39} {:<39} {:>4} {:<11}",
             "PORT", "WAN IFACE IP", "PUBLIC EXIT IP", "HITS", "STATUS"
         );
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
@@ -1401,8 +1401,8 @@ mod wan_ip_mapping_tests {
         let map = parse_wan_ip_map("WAN1=203.0.113.1; WAN2=203.0.113.1");
         let samples = parse_egress_ip_observations("api.ipify.org=203.0.113.1");
         let rows = build_wan_port_rows(&map, &samples);
-        assert!(rows[0].contains("DUP IP"));
-        assert!(rows[1].contains("DUP IP"));
+        assert!(rows[0].contains("DUP EXIT IP"));
+        assert!(rows[1].contains("DUP EXIT IP"));
     }
 
     #[test]
@@ -2254,7 +2254,7 @@ unsafe extern "system" fn wnd_proc(
             let lbl_wan_header = unsafe {
                 create_ctrl(
                     w!("STATIC"),
-                    " PORT   WAN PUBLIC IP                           HITS   STATUS   PROBE PROVIDERS",
+                    " PORT   WAN IFACE IP                            PUBLIC EXIT IP                           HITS STATUS",
                     st_left,
                     0,
                     hwnd,
