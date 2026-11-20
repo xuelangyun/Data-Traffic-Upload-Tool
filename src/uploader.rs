@@ -424,7 +424,7 @@ pub async fn run_upload_test(
     let (http_urls, rejected) = parse_http_upload_targets(&config.upload_targets);
     if !rejected.is_empty() {
         log.push(format!(
-            "提示：已忽略非 HTTP 目标（Raw TCP 无服务端确认机制，不能作为有效上传测速）: {}",
+            "提示：已忽略非 HTTP 目标（Raw TCP 不在当前 HTTP 上传测速模块中实现，已忽略）: {}",
             rejected.join(", ")
         ));
     }
@@ -498,7 +498,7 @@ pub async fn run_upload_test(
     let coord_task = tokio::spawn(async move {
         let mut tier_idx = 0usize;
         let mut tier_started_at = Instant::now();
-        let mut tier_start_confirmed = 0u64;
+        let mut tier_start_accepted = 0u64;
         let mut tier_start_ok = 0u64;
         let mut tier_start_fail = 0u64;
         let mut best_tier = initial_conc;
@@ -530,28 +530,28 @@ pub async fn run_upload_test(
                 break;
             }
 
-            let now_confirmed = coord_stats.up_bytes_total.load(Ordering::Relaxed);
+            let now_accepted = coord_stats.up_bytes_total.load(Ordering::Relaxed);
             let now_time = Instant::now();
 
             // Capture post-warmup valid window baseline
             if !warmup_captured && elapsed_s >= warmup_secs {
                 warmup_captured = true;
-                valid_start_bytes = now_confirmed;
+                valid_start_bytes = now_accepted;
                 valid_start_time = now_time;
             }
 
             // Record 500ms valid-window throughput sample & average
             let dt = now_time.duration_since(last_sample_time).as_secs_f64();
             if dt > 0.05 {
-                let delta_b = now_confirmed.saturating_sub(last_sample_bytes);
+                let delta_b = now_accepted.saturating_sub(last_sample_bytes);
                 let inst_bps = ((delta_b as f64) * 8.0 / dt) as u64;
-                last_sample_bytes = now_confirmed;
+                last_sample_bytes = now_accepted;
                 last_sample_time = now_time;
                 if warmup_captured {
                     valid_samples.push(inst_bps);
                     let valid_dt = now_time.duration_since(valid_start_time).as_secs_f64();
                     if valid_dt > 0.2 {
-                        let valid_bytes = now_confirmed.saturating_sub(valid_start_bytes);
+                        let valid_bytes = now_accepted.saturating_sub(valid_start_bytes);
                         let avg_bps = ((valid_bytes as f64) * 8.0 / valid_dt) as u64;
                         coord_stats.up_bps_avg.store(avg_bps, Ordering::Relaxed);
                     }
@@ -568,7 +568,7 @@ pub async fn run_upload_test(
                 let tier_dur = tier_started_at.elapsed().as_secs_f64();
                 if tier_dur >= 2.5 {
                     let cur_tier = CONCURRENCY_TIERS[tier_idx];
-                    let tier_bytes = now_confirmed.saturating_sub(tier_start_confirmed);
+                    let tier_bytes = now_accepted.saturating_sub(tier_start_accepted);
                     let tier_bps = ((tier_bytes as f64) * 8.0 / tier_dur) as u64;
 
                     let ok_now = coord_stats.up_requests_ok.load(Ordering::Relaxed);
@@ -617,7 +617,7 @@ pub async fn run_upload_test(
                             .store(next_tier, Ordering::Relaxed);
                         coord_notify.notify_waiters();
                         tier_started_at = Instant::now();
-                        tier_start_confirmed = now_confirmed;
+                        tier_start_accepted = now_accepted;
                         tier_start_ok = ok_now;
                         tier_start_fail = fail_now;
                         coord_log.push(format!(
@@ -887,7 +887,7 @@ fn log_upload_node_report(nodes: &[UploadNode], log: &MemoryLog) {
         let lat = m.avg_latency_ms();
         let bytes = m.bytes_http_accepted.load(Ordering::Relaxed);
         log.push(format!(
-            "  · {} | 速率:{} | 确认:{} | 请求成/败:{ok}/{fail} | POST:{} | 平均延迟:{lat}ms",
+            "  · {} | 速率:{} | HTTP 2xx接受:{} | 请求成/败:{ok}/{fail} | POST:{} | 平均延迟:{lat}ms",
             m.host,
             format_mbps(ema),
             format_bytes(bytes),
