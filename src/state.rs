@@ -765,7 +765,7 @@ impl SharedStats {
         parts.join(" · ")
     }
 
-    /// Vertical WAN rows: one per healthy target, sorted by active desc, with share %
+    /// Remote-target rows sorted by current active connections, with current active share %
     pub fn target_distribution_rows(&self) -> Vec<TargetDistributionRow> {
         let guard = self.target_metrics.lock();
         let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
