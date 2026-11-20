@@ -667,12 +667,11 @@ fn log_target_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &
         return;
     }
     log.push(header);
-    let total_peak: usize = snapshot
+    let total_active: usize = snapshot
         .iter()
         .filter(|t| t.healthy)
-        .map(|t| t.peak_conns.load(Ordering::Relaxed))
-        .sum::<usize>()
-        .max(1);
+        .map(|t| t.active_conns.load(Ordering::Relaxed))
+        .sum();
 
     for t in &snapshot {
         if !t.healthy {
@@ -680,7 +679,7 @@ fn log_target_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &
         }
         let act = t.active_conns.load(Ordering::Relaxed);
         let pk = t.peak_conns.load(Ordering::Relaxed);
-        let share = (pk as f64) * 100.0 / (total_peak as f64);
+        let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
         let orig_ok = t.orig_success.load(Ordering::Relaxed);
         let orig_att = t.orig_attempts.load(Ordering::Relaxed);
         let orig_pct = t.orig_success_rate_pct();
@@ -692,7 +691,7 @@ fn log_target_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &
         let f_to = t.fail_timeout.load(Ordering::Relaxed);
         let avg_rtt = t.avg_rtt_ms();
         log.push(format!(
-            "  · {} [{}] | 存活/峰值:{act}/{pk} (占比{share:.1}%) | 原始:{orig_ok}/{orig_att}({orig_pct:.1}%) | 补建:{rep_ok}/{rep_att} | 归属(本机:{f_loc} 拒:{f_ref} 远闭:{f_rem} 超时:{f_to}) | RTT:{avg_rtt}ms",
+            "  · {} [{}] | 存活/峰值:{act}/{pk} (当前存活占比{share:.1}%) | 原始:{orig_ok}/{orig_att}({orig_pct:.1}%) | 补建:{rep_ok}/{rep_att} | 归属(本机:{f_loc} 拒:{f_ref} 远闭:{f_rem} 超时:{f_to}) | RTT:{avg_rtt}ms",
             t.label, t.resolved_addr
         ));
     }
@@ -947,7 +946,7 @@ pub async fn run_conn_test(
         stats.conn_holding.store(false, Ordering::Relaxed);
     }
 
-    // Final WAN snapshot while sockets or peaks are intact before teardown
+    // Final remote-target snapshot while sockets or peaks are intact before teardown
     log_target_distribution_table(
         &stats,
         &log,
