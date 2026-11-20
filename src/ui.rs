@@ -1,34 +1,13 @@
-//! Native Windows GUI built directly with Win32 API (`windows` crate).
+//! Native Windows GUI built directly with Win32 API (`windows` crate 0.100+).
 //! Zero disk usage: all controls, metrics, and ring-buffer logs live strictly in RAM.
 
 use std::ffi::c_void;
+use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, GetStockObject,
-    GetSysColorBrush, HFONT, HGDIOBJ, UpdateWindow,
-};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
-use windows::Win32::UI::WindowsAndMessaging::{
-    BN_CLICKED, BS_GROUPBOX, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
-    ES_MULTILINE, ES_NUMBER, ES_READONLY, GWLP_USERDATA, GetClientRect, GetMessageW,
-    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, KillTimer,
-    LoadCursorW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MINMAXINFO, MSG, MessageBoxW,
-    NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SIZE,
-    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
-};
-use windows::core::{PCWSTR, w};
+use windows::Win32::*;
+use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::engine::EngineHandle;
 use crate::state::{
@@ -90,7 +69,7 @@ struct Controls {
 
 impl Default for Controls {
     fn default() -> Self {
-        let z = HWND::default();
+        let z: HWND = null_mut();
         Self {
             grp_stats: z,
             lbl_mode: z,
@@ -137,9 +116,9 @@ struct WindowData {
 
 impl Drop for WindowData {
     fn drop(&mut self) {
-        if self.owns_font && !self.font.0.is_null() {
+        if self.owns_font && !self.font.is_null() {
             unsafe {
-                let _ = DeleteObject(HGDIOBJ(self.font.0));
+                let _ = DeleteObject(self.font.cast());
             }
         }
     }
@@ -163,7 +142,7 @@ fn get_window_text(hwnd: HWND) -> String {
             return String::new();
         }
         let mut buf = vec![0u16; (len as usize) + 2];
-        let copied = GetWindowTextW(hwnd, &mut buf);
+        let copied = GetWindowTextW(hwnd, PWSTR(buf.as_mut_ptr()), buf.len() as i32);
         if copied <= 0 {
             return String::new();
         }
@@ -178,36 +157,36 @@ fn create_ui_font() -> (HFONT, bool) {
             ..Default::default()
         };
         if SystemParametersInfoW(
-            SPI_GETNONCLIENTMETRICS,
+            SPI_GETNONCLIENTMETRICS as u32,
             ncm.cbSize,
-            Some((&mut ncm as *mut NONCLIENTMETRICSW).cast::<c_void>()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+            (&mut ncm as *mut NONCLIENTMETRICSW).cast::<c_void>(),
+            0,
         )
-        .is_ok()
+        .as_bool()
         {
             let font = CreateFontIndirectW(&ncm.lfMessageFont);
-            if !font.0.is_null() {
+            if !font.is_null() {
                 return (font, true);
             }
         }
-        (HFONT(GetStockObject(DEFAULT_GUI_FONT).0), false)
+        (GetStockObject(DEFAULT_GUI_FONT).cast(), false)
     }
 }
 
 unsafe fn spawn_child(
     parent: HWND,
-    ex_style: WINDOW_EX_STYLE,
+    ex_style: u32,
     class_name: PCWSTR,
     text: &str,
-    style: WINDOW_STYLE,
+    style: u32,
     id: u16,
     font: HFONT,
 ) -> HWND {
     let wtext = to_wide(text);
     let hmenu = if id == 0 {
-        HMENU::default()
+        None
     } else {
-        HMENU(id as usize as *mut c_void)
+        Some((id as usize) as HMENU)
     };
     let hwnd = unsafe {
         CreateWindowExW(
@@ -219,17 +198,16 @@ unsafe fn spawn_child(
             0,
             100,
             24,
-            parent,
+            Some(parent),
             hmenu,
-            HINSTANCE::default(),
+            None,
             None,
         )
-    }
-    .unwrap_or_default();
+    };
 
-    if !hwnd.0.is_null() && !font.0.is_null() {
+    if !hwnd.is_null() && !font.is_null() {
         unsafe {
-            SendMessageW(hwnd, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(0));
+            SendMessageW(hwnd, WM_SETFONT as u32, font as usize, 0);
         }
     }
     hwnd
@@ -240,28 +218,24 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
     data.font = font;
     data.owns_font = owns_font;
 
-    let grp_style = WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_GROUPBOX as u32);
-    let lbl_style = WS_CHILD | WS_VISIBLE;
-    let edit_single_style =
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(ES_AUTOHSCROLL as u32);
-    let edit_num_style = edit_single_style | WINDOW_STYLE(ES_NUMBER as u32);
-    let edit_multi_style = WS_CHILD
-        | WS_VISIBLE
-        | WS_TABSTOP
-        | WS_VSCROLL
-        | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL) as u32);
-    let edit_log_style = WS_CHILD
-        | WS_VISIBLE
-        | WS_VSCROLL
-        | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY) as u32);
-    let btn_style = WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_PUSHBUTTON as u32);
+    let grp_style = (WS_CHILD | WS_VISIBLE | BS_GROUPBOX) as u32;
+    let lbl_style = (WS_CHILD | WS_VISIBLE) as u32;
+    let edit_single_style = (WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL) as u32;
+    let edit_num_style = edit_single_style | (ES_NUMBER as u32);
+    let edit_multi_style =
+        (WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL)
+            as u32;
+    let edit_log_style =
+        (WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY) as u32;
+    let btn_style = (WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON) as u32;
+    let ex_edge = WS_EX_CLIENTEDGE as u32;
 
     unsafe {
         let c = &mut data.controls;
 
         c.grp_stats = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "实时状态与监控 (纯内存)",
             grp_style,
@@ -270,7 +244,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_mode = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "当前状态: 空闲 (就绪)",
             lbl_style,
@@ -279,7 +253,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_conn = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "连接测试: 当前 0 | 峰值 0 | 最大稳定 0 | 失败(超时/拒绝/资源/其他) 0/0/0/0",
             lbl_style,
@@ -288,7 +262,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_up = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "上行压测: 实时 0.00 Mbps | 峰值 0.00 Mbps | 累计 0 B | 活跃流 0 | 错误 0",
             lbl_style,
@@ -297,7 +271,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_down = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "下行压测: 实时 0.00 Mbps | 峰值 0.00 Mbps | 累计 0 B | 活跃流 0 | 错误 0",
             lbl_style,
@@ -306,7 +280,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_sys = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "系统指标: 本机 ESTABLISHED TCP: 0 | 进程句柄: 0 | 磁盘读写: 0 (纯内存)",
             lbl_style,
@@ -316,7 +290,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.grp_cfg = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "测试参数与公网目标节点 (仅内存生效，支持临时编辑)",
             grp_style,
@@ -325,7 +299,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_streams = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "并发流数 (1-128):",
             lbl_style,
@@ -334,7 +308,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_streams = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             &DEFAULT_STREAM_CONCURRENCY.to_string(),
             edit_num_style,
@@ -343,7 +317,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_max_conn = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "连接探测上限:",
             lbl_style,
@@ -352,7 +326,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_max_conn = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             &DEFAULT_MAX_CONNS_CAP.to_string(),
             edit_num_style,
@@ -361,7 +335,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.lbl_hold_secs = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "稳定观察(秒):",
             lbl_style,
@@ -370,7 +344,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_hold_secs = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             &DEFAULT_HOLD_SECS.to_string(),
             edit_num_style,
@@ -380,7 +354,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.lbl_tcp_targets = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "连接测试目标 (ip:port，逗号或换行分隔):",
             lbl_style,
@@ -389,7 +363,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_tcp_targets = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             DEFAULT_TCP_TARGETS,
             edit_single_style,
@@ -399,7 +373,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.lbl_up_targets = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "上行测试目标 (http(s):// POST 端点 或 tcp://ip:port):",
             lbl_style,
@@ -408,7 +382,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_up_targets = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             DEFAULT_UPLOAD_TARGETS,
             edit_single_style,
@@ -418,7 +392,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.lbl_down_targets = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("STATIC"),
             "下行测试目标 (每行一个公网大文件 URL，优先国内镜像/CDN):",
             lbl_style,
@@ -427,7 +401,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.edit_down_targets = spawn_child(
             hwnd,
-            WS_EX_CLIENTEDGE,
+            ex_edge,
             w!("EDIT"),
             DEFAULT_DOWNLOAD_TARGETS,
             edit_multi_style,
@@ -437,7 +411,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.btn_conn = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "开始最大连接数测试",
             btn_style,
@@ -446,7 +420,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_up = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "开始持续上传压测",
             btn_style,
@@ -455,7 +429,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_down = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "开始持续下载压测",
             btn_style,
@@ -464,7 +438,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_stop = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "停止当前测试",
             btn_style,
@@ -473,7 +447,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_reset = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "重置默认节点",
             btn_style,
@@ -482,7 +456,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_clear_log = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "清空内存日志",
             btn_style,
@@ -491,7 +465,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
         );
         c.btn_help = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "说明与声明",
             btn_style,
@@ -501,54 +475,38 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
 
         c.grp_log = spawn_child(
             hwnd,
-            WINDOW_EX_STYLE::default(),
+            0,
             w!("BUTTON"),
             "运行日志 (内存环形缓冲，最多保留 400 条，可 Ctrl+C 复制)",
             grp_style,
             0,
             font,
         );
-        c.edit_log = spawn_child(
-            hwnd,
-            WS_EX_CLIENTEDGE,
-            w!("EDIT"),
-            "",
-            edit_log_style,
-            0,
-            font,
-        );
-        SendMessageW(c.edit_log, EM_SETLIMITTEXT, WPARAM(0), LPARAM(0));
+        c.edit_log = spawn_child(hwnd, ex_edge, w!("EDIT"), "", edit_log_style, 0, font);
+        SendMessageW(c.edit_log, EM_SETLIMITTEXT, 0, 0);
     }
 }
 
 fn place(hwnd: HWND, x: i32, y: i32, w: i32, h: i32) {
     unsafe {
-        let _ = windows::Win32::UI::WindowsAndMessaging::MoveWindow(
-            hwnd,
-            x,
-            y,
-            w.max(10),
-            h.max(10),
-            true,
-        );
+        let _ = MoveWindow(hwnd, x, y, w.max(10), h.max(10), true);
     }
 }
 
 fn layout_controls(hwnd: HWND, data: &WindowData) {
     let mut rc = RECT::default();
     unsafe {
-        if GetClientRect(hwnd, &mut rc).is_err() {
+        if !GetClientRect(hwnd, &mut rc).as_bool() {
             return;
         }
     }
 
     let cw = rc.right - rc.left;
     let ch = rc.bottom - rc.top;
-    let m = 12; // outer margin
+    let m = 12;
     let inner_w = (cw - m * 2).max(400);
     let c = &data.controls;
 
-    // 1. Stats group (fixed height ~148)
     let stats_h = 148;
     place(c.grp_stats, m, m, inner_w, stats_h);
     let sx = m + 14;
@@ -559,7 +517,6 @@ fn layout_controls(hwnd: HWND, data: &WindowData) {
     place(c.lbl_down, sx, m + 94, sw, 20);
     place(c.lbl_sys, sx, m + 118, sw, 20);
 
-    // 2. Config group (fixed height ~264)
     let cfg_y = m + stats_h + 10;
     let cfg_h = 264;
     place(c.grp_cfg, m, cfg_y, inner_w, cfg_h);
@@ -584,7 +541,6 @@ fn layout_controls(hwnd: HWND, data: &WindowData) {
     place(c.lbl_down_targets, sx, row4_y, sw, 18);
     place(c.edit_down_targets, sx, row4_y + 20, sw, 80);
 
-    // 3. Action buttons bar
     let btn_y = cfg_y + cfg_h + 10;
     let btn_h = 32;
     let gap = 8;
@@ -604,7 +560,6 @@ fn layout_controls(hwnd: HWND, data: &WindowData) {
         bx += bw + gap;
     }
 
-    // 4. Log group fills remaining vertical space
     let log_y = btn_y + btn_h + 10;
     let log_h = (ch - log_y - m).max(120);
     place(c.grp_log, m, log_y, inner_w, log_h);
@@ -712,7 +667,6 @@ fn refresh_ui(data: &mut WindowData) {
         }
     }
 
-    // Incrementally sync memory log into the read-only edit control
     let (new_gen, new_seq, lines, full_reset) = data
         .state
         .log
@@ -725,34 +679,19 @@ fn refresh_ui(data: &mut WindowData) {
         }
         set_window_text(c.edit_log, &joined);
         unsafe {
-            let len = GetWindowTextLengthW(c.edit_log);
-            SendMessageW(
-                c.edit_log,
-                EM_SETSEL,
-                WPARAM(len as usize),
-                LPARAM(len as isize),
-            );
-            SendMessageW(c.edit_log, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+            let len = GetWindowTextLengthW(c.edit_log).max(0);
+            SendMessageW(c.edit_log, EM_SETSEL, len as usize, len as isize);
+            SendMessageW(c.edit_log, EM_SCROLLCARET, 0, 0);
         }
     } else if !lines.is_empty() {
         let mut chunk = lines.join("\r\n");
         chunk.push_str("\r\n");
         let w_chunk = to_wide(&chunk);
         unsafe {
-            let len = GetWindowTextLengthW(c.edit_log);
-            SendMessageW(
-                c.edit_log,
-                EM_SETSEL,
-                WPARAM(len as usize),
-                LPARAM(len as isize),
-            );
-            SendMessageW(
-                c.edit_log,
-                EM_REPLACESEL,
-                WPARAM(0),
-                LPARAM(w_chunk.as_ptr() as isize),
-            );
-            SendMessageW(c.edit_log, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
+            let len = GetWindowTextLengthW(c.edit_log).max(0);
+            SendMessageW(c.edit_log, EM_SETSEL, len as usize, len as isize);
+            SendMessageW(c.edit_log, EM_REPLACESEL, 0, w_chunk.as_ptr() as isize);
+            SendMessageW(c.edit_log, EM_SCROLLCARET, 0, 0);
         }
     }
 
@@ -767,10 +706,10 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.tcp_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        hwnd,
+                        Some(hwnd),
                         w!("请先填写至少一个有效的 TCP 测试目标 (ip:port)。"),
                         w!("参数提示"),
-                        MB_OK | MB_ICONWARNING,
+                        (MB_OK | MB_ICONWARNING) as u32,
                     );
                 }
                 return;
@@ -783,10 +722,10 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.upload_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        hwnd,
+                        Some(hwnd),
                         w!("请先填写至少一个上传目标 (http(s)://... 或 tcp://ip:port)。"),
                         w!("参数提示"),
-                        MB_OK | MB_ICONWARNING,
+                        (MB_OK | MB_ICONWARNING) as u32,
                     );
                 }
                 return;
@@ -799,10 +738,10 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.download_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        hwnd,
+                        Some(hwnd),
                         w!("请先填写至少一个下载目标 URL。"),
                         w!("参数提示"),
-                        MB_OK | MB_ICONWARNING,
+                        (MB_OK | MB_ICONWARNING) as u32,
                     );
                 }
                 return;
@@ -846,7 +785,12 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
                   netsh int ipv4 set dynamicport tcp start=10000 num=55000"
             );
             unsafe {
-                MessageBoxW(hwnd, msg, w!("使用说明与合规声明"), MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(
+                    Some(hwnd),
+                    msg,
+                    w!("使用说明与合规声明"),
+                    (MB_OK | MB_ICONINFORMATION) as u32,
+                );
             }
         }
         _ => {}
@@ -859,8 +803,8 @@ unsafe extern "system" fn wndproc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if msg == WM_NCCREATE {
-        let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
+    if msg == WM_NCCREATE as u32 {
+        let cs = unsafe { &*(lparam as *const CREATESTRUCTW) };
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
         }
@@ -873,56 +817,56 @@ unsafe extern "system" fn wndproc(
     }
     let data = unsafe { &mut *ptr };
 
-    match msg {
+    match msg as i32 {
         WM_CREATE => {
             create_controls(hwnd, data);
             layout_controls(hwnd, data);
             refresh_ui(data);
             unsafe {
-                SetTimer(hwnd, TIMER_REFRESH_ID, 250, None);
+                SetTimer(Some(hwnd), TIMER_REFRESH_ID, 250, None);
             }
-            LRESULT(0)
+            0
         }
         WM_SIZE => {
             layout_controls(hwnd, data);
-            LRESULT(0)
+            0
         }
         WM_GETMINMAXINFO => {
-            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+            let mmi = unsafe { &mut *(lparam as *mut MINMAXINFO) };
             mmi.ptMinTrackSize.x = 840;
             mmi.ptMinTrackSize.y = 620;
-            LRESULT(0)
+            0
         }
         WM_TIMER => {
-            if wparam.0 == TIMER_REFRESH_ID {
+            if wparam == TIMER_REFRESH_ID {
                 refresh_ui(data);
             }
-            LRESULT(0)
+            0
         }
         WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as u16;
-            let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
+            let id = (wparam & 0xFFFF) as u16;
+            let code = ((wparam >> 16) & 0xFFFF) as u16;
             if code == BN_CLICKED as u16 {
                 handle_command(hwnd, id, data);
             }
-            LRESULT(0)
+            0
         }
         WM_DESTROY => {
             unsafe {
-                let _ = KillTimer(hwnd, TIMER_REFRESH_ID);
+                let _ = KillTimer(Some(hwnd), TIMER_REFRESH_ID);
             }
             data.engine.stop();
             unsafe {
                 PostQuitMessage(0);
             }
-            LRESULT(0)
+            0
         }
         WM_NCDESTROY => {
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));
             }
-            LRESULT(0)
+            0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -933,18 +877,21 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }
-        .map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
-    let hinstance: HINSTANCE = hmodule.into();
+    let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) };
+    if hinstance.is_null() {
+        return Err("GetModuleHandleW failed".to_string());
+    }
 
     let class_name = w!("WinNetStressMainWnd");
-    let hcursor = unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW) }
-        .map_err(|e| format!("LoadCursorW failed: {e}"))?;
+    let hcursor = unsafe { LoadCursorW(None, PCWSTR(IDC_ARROW.0.cast())) };
+    if hcursor.is_null() {
+        return Err("LoadCursorW failed".to_string());
+    }
     let hbrush = unsafe { GetSysColorBrush(COLOR_BTNFACE) };
 
     let wc = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: (CS_HREDRAW | CS_VREDRAW) as u32,
         lpfnWndProc: Some(wndproc),
         hInstance: hinstance,
         hCursor: hcursor,
@@ -962,7 +909,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         state,
         engine,
         controls: Controls::default(),
-        font: HFONT::default(),
+        font: null_mut(),
         owns_font: false,
         seen_log_gen: 0,
         seen_log_seq: 0,
@@ -970,39 +917,36 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
     });
     let raw_ptr = Box::into_raw(boxed);
 
-    let hwnd_res = unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            0,
             class_name,
             w!("公网连接与带宽极限测试工具 (纯内存 / WinAPI)"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            (WS_OVERLAPPEDWINDOW | WS_VISIBLE) as u32,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             960,
             740,
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
+            None,
+            None,
+            Some(hinstance),
             Some(raw_ptr.cast::<c_void>()),
         )
     };
 
-    let hwnd = match hwnd_res {
-        Ok(h) => h,
-        Err(e) => {
-            unsafe {
-                drop(Box::from_raw(raw_ptr));
-            }
-            return Err(format!("CreateWindowExW failed: {e}"));
+    if hwnd.is_null() {
+        unsafe {
+            drop(Box::from_raw(raw_ptr));
         }
-    };
+        return Err("CreateWindowExW failed".to_string());
+    }
 
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }

@@ -8,8 +8,7 @@ pub struct SysSnapshot {
 
 #[cfg(windows)]
 pub fn query_sys_snapshot() -> SysSnapshot {
-    use windows::Win32::NetworkManagement::IpHelper::{GetTcpStatistics, MIB_TCPSTATS_LH};
-    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    use windows::Win32::*;
 
     let mut tcp_stats = MIB_TCPSTATS_LH::default();
     let tcp_estab = unsafe {
@@ -40,8 +39,11 @@ pub fn query_sys_snapshot() -> SysSnapshot {
 /// Format current local time as `HH:MM:SS` without touching filesystem / tz files.
 #[cfg(windows)]
 pub fn format_local_hms() -> String {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
-    let st = unsafe { GetLocalTime() };
+    use windows::Win32::*;
+    let mut st = SYSTEMTIME::default();
+    unsafe {
+        GetLocalTime(&mut st);
+    }
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
