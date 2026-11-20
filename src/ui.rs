@@ -1133,8 +1133,7 @@ impl UiState {
             set_lv_cell(lv, 3, 5, &mut self.cache.bandwidth_cells[3][5], format!("上行 {} · 下行 {}", up_rank, down_rank));
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
         }
-        // Public IP providers observe public egress identities; local source-IP groups below
-        // come from actual TCP sockets and are not assumed to be physical WAN port identities.
+        // Group the latest external reflector responses by their observed public egress IP.
         let wan_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last == 0 {
