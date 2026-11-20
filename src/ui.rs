@@ -984,7 +984,7 @@ impl UiState {
         let up_rank = crate::state::SharedStats::node_ranking_summary(&stats.up_node_metrics);
         let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
         let egress_ips = crate::sys_stats::query_egress_local_ips();
-        let wan_ip_raw = stats.wan_public_ip.lock().clone();
+        let wan_ip_raw = stats.egress_ip_observations.lock().clone();
 
         // Helper to update ListView cell with cache check (prevent jitter)
         let mut set_lv_cell = |hwnd: HWND, row: i32, col: i32, cache: &mut String, next: String| {
@@ -1103,7 +1103,7 @@ impl UiState {
         // WAN ListView + header IP line with async alignment
         let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw=="检测中..." { "检测中...".to_string() } else { wan_ip_raw.clone() };
         let wan_age = {
-            let last = stats.wan_last_update_ms.load(Ordering::Relaxed);
+            let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last==0 {"".to_string()} else {
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let secs = now_ms.saturating_sub(last)/1000;
