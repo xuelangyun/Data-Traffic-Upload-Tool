@@ -629,13 +629,14 @@ unsafe fn lv_insert_column(hwnd: HWND, idx: i32, title: &str, width: i32, fmt: i
 }
 
 unsafe fn lv_insert_row(hwnd: HWND, row: i32) {
+    let mut empty_text = to_wide_null("");
     let mut item = LVITEMW {
         mask: LVIF_TEXT as u32,
         iItem: row,
         iSubItem: 0,
         state: 0,
         stateMask: 0,
-        pszText: PWSTR(to_wide_null("").as_ptr() as *mut u16),
+        pszText: PWSTR(empty_text.as_mut_ptr()),
         cchTextMax: 0,
         iImage: 0,
         lParam: LPARAM(0),
@@ -1100,7 +1101,7 @@ impl UiState {
             set_lv_cell(lv, 0, 2, &mut self.cache.bandwidth_cells[0][2], format_mbps(up_peak));
             set_lv_cell(lv, 0, 3, &mut self.cache.bandwidth_cells[0][3], format!("{} / P95 {}", format_mbps(up_avg), format_mbps(up_p95)));
             set_lv_cell(lv, 0, 4, &mut self.cache.bandwidth_cells[0][4], format_bytes(up_total));
-            set_lv_cell(lv, 0, 5, &mut self.cache.bandwidth_cells[0][5], format!("请求体供给 · 累计仅计完整 2xx · 延迟{up_lat}ms"));
+            set_lv_cell(lv, 0, 5, &mut self.cache.bandwidth_cells[0][5], format!("实时/峰值为请求体供给；均值/P95/累计仅计完整2xx · 延迟{up_lat}ms"));
 
             // Download current: actual response bytes read in the latest ~1s window.
             set_lv_cell(lv, 1, 0, &mut self.cache.bandwidth_cells[1][0], "下行".to_string());
