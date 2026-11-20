@@ -4,6 +4,7 @@
 //! pure in-memory state updates.
 
 use std::ffi::c_void;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -27,7 +28,7 @@ const ID_BTN_CLEAR_LOG: usize = 1007;
 const ID_BTN_HELP: usize = 1008;
 const ID_CHK_CONTINUOUS: usize = 1010;
 const ID_TIMER_REFRESH: usize = 2001;
-const MAX_TARGET_ROWS: usize = 8;
+const MAX_WAN_PORTS: usize = 4;
 const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
 // Classic Win32 Edit control messages omitted from windows crate UI bindings.
@@ -56,7 +57,7 @@ struct LabelCache {
     rank_row: String,
     wan_ip: String,
     wan_header: String,
-    wan_rows: [String; MAX_TARGET_ROWS],
+    wan_rows: [String; MAX_WAN_PORTS],
 }
 
 struct SystemColors {
@@ -124,6 +125,7 @@ struct ThemeResources {
     font_bold: HFONT,
     font_log: HFONT,
     font_small: HFONT,
+    font_mono: HFONT,
     colors: SystemColors,
     brush_bg: HBRUSH,
     brush_card: HBRUSH,
@@ -134,6 +136,12 @@ impl ThemeResources {
         let safe_dpi = dpi.max(96);
         let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
+        let font_mono = unsafe {
+            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
+        };
+        let font_mono = unsafe {
+            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
+        };
         let colors = unsafe { SystemColors::query() };
         let brush_bg = unsafe { CreateSolidBrush(colors.bg) };
         let brush_card = unsafe { CreateSolidBrush(colors.card) };
@@ -147,6 +155,7 @@ impl ThemeResources {
             font_bold,
             font_log,
             font_small,
+            font_mono,
             colors,
             brush_bg,
             brush_card,
@@ -161,6 +170,8 @@ impl ThemeResources {
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
             delete_font(&mut self.font_small);
+            delete_font(&mut self.font_mono);
+            delete_font(&mut self.font_mono);
         }
         let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
@@ -170,6 +181,7 @@ impl ThemeResources {
         self.font_bold = font_bold;
         self.font_log = font_log;
         self.font_small = font_small;
+        self.font_mono = font_mono;
         self.line_h = line_h;
         self.title_h = title_h;
     }
@@ -487,6 +499,8 @@ struct UiState {
     edit_up_targets: HWND,
     lbl_down_targets: HWND,
     edit_down_targets: HWND,
+    lbl_wan_map: HWND,
+    edit_wan_map: HWND,
 
     // Action buttons
     btn_conn: HWND,
@@ -518,7 +532,7 @@ struct UiState {
     grp_wan: HWND,
     lbl_wan_ip: HWND,
     lbl_wan_header: HWND,
-    wan_rows: [HWND; MAX_TARGET_ROWS],
+    wan_rows: [HWND; MAX_WAN_PORTS],
 
     // Chart (no child window clip - painted directly on parent)
     lbl_chart_title: HWND,
@@ -627,6 +641,8 @@ impl UiState {
             set_font(self.edit_up_targets, t.font_ui);
             set_font(self.lbl_down_targets, t.font_ui);
             set_font(self.edit_down_targets, t.font_ui);
+            set_font(self.lbl_wan_map, t.font_ui);
+            set_font(self.edit_wan_map, t.font_ui);
 
             set_font(self.btn_conn, t.font_bold);
             set_font(self.btn_up, t.font_bold);
@@ -653,9 +669,9 @@ impl UiState {
 
             set_font(self.grp_wan, t.font_bold);
             set_font(self.lbl_wan_ip, t.font_small);
-            set_font(self.lbl_wan_header, t.font_small);
+            set_font(self.lbl_wan_header, t.font_mono);
             for &hw in &self.wan_rows {
-                set_font(hw, t.font_small);
+                set_font(hw, t.font_mono);
             }
             set_font(self.lbl_chart_title, t.font_bold);
             set_font(self.grp_log, t.font_bold);
@@ -828,6 +844,10 @@ impl UiState {
         );
         cy += multi_edit_h + s(8);
 
+        defer(&mut hdwp, self.lbl_wan_map, cfg_x, cy, target_lbl_w, edit_h);
+        defer(&mut hdwp, self.edit_wan_map, target_edt_x, cy, target_edt_w, edit_h);
+        cy += edit_h + s(8);
+
         let cfg_h = cy - cfg_top;
         defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
         y = cfg_top + cfg_h + s(6);
@@ -947,6 +967,7 @@ impl UiState {
             set_text(self.edit_tcp_targets, DEFAULT_TCP_TARGETS);
             set_text(self.edit_up_targets, DEFAULT_UPLOAD_TARGETS);
             set_text(self.edit_down_targets, DEFAULT_DOWNLOAD_TARGETS);
+            set_text(self.edit_wan_map, "WAN1=; WAN2=; WAN3=; WAN4=");
             let _ = SendMessageW(
                 self.chk_continuous,
                 BM_SETCHECK as u32,
@@ -1183,7 +1204,7 @@ impl UiState {
 
         // Independent public-IP observations by destination; not a WAN1/WAN2 mapping.
         let egress_ip_raw = stats.egress_ip_observations.lock().clone();
-        let egress_ip_disp = if egress_ip_raw.is_empty() { "等待探测".to_string() } else { egress_ip_raw };
+        let egress_ip_disp = if egress_ip_raw.is_empty() { "等待探测".to_string() } else { egress_ip_raw.clone() };
         let egress_ip_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last==0 { "".to_string() } else {
@@ -1195,31 +1216,15 @@ impl UiState {
         let egress_ip_text = format!("公网出口 IP 抽样（按独立探测目标；不等同 WAN 线路）: {}{}", egress_ip_disp, egress_ip_age);
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
-        let wan_header_text = "  序号  远端目标                     存活/峰值   建连成功率 RTT 当前占比".to_string();
+        let wan_header_text = "PORT   WAN PUBLIC IP                           HITS   STATUS   PROBE PROVIDERS".to_string();
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
-        let target_rows = stats.target_distribution_rows();
-        for idx in 0..MAX_TARGET_ROWS {
-            let next = if idx < target_rows.len() {
-                let r = &target_rows[idx];
-                // Format aligned columns: use fixed-width like formatting
-                // e.g., " ① 223.5.5.5:443 (223.5.5.5)    12/45  98.1%  14ms  31.2%"
-                let target_label = format!("{} ({})", r.label, r.resolved);
-                let label_disp: String = target_label.chars().take(22).collect();
-                format!("  {:>2}. {:<24} {:>3}/{:<3}  {:>5.1}%  {:>3}ms  {:>4.1}%",
-                    idx+1, label_disp, r.active, r.peak, r.pct, r.rtt, r.share)
-            } else {
-                if stats.mode()==crate::state::AppMode::Idle && idx==0 {
-                    "  (空闲 — 开始连接测试后显示远端目标分布)".to_string()
-                } else if target_rows.is_empty() && idx==0 {
-                    "  等待健康检查...".to_string()
-                } else {
-                    "".to_string()
-                }
-            };
-            // Show/hide row window based on emptiness?
+        let wan_map = parse_wan_ip_map(&unsafe { get_text(self.edit_wan_map) });
+        let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
+        let wan_rows = build_wan_port_rows(&wan_map, &wan_samples);
+        for idx in 0..MAX_WAN_PORTS {
+            let next = wan_rows[idx].clone();
             let hwnd = self.wan_rows[idx];
-            // We still update text even if empty to clear
             unsafe { set_cached_text(hwnd, &mut self.cache.wan_rows[idx], next) };
             let show = !self.cache.wan_rows[idx].is_empty();
             let _ = unsafe { ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE }) };
@@ -1783,6 +1788,30 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let lbl_wan_map = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "WAN口公网IP映射（WAN1=IP; WAN2=IP...）:",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_ui,
+                )
+            };
+            let edit_wan_map = unsafe {
+                create_ctrl(
+                    w!("EDIT"),
+                    "WAN1=; WAN2=; WAN3=; WAN4=",
+                    edt_single,
+                    WS_EX_CLIENTEDGE as u32,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_ui,
+                )
+            };
             let lbl_down_targets = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -2092,7 +2121,7 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_small,
                 )
             };
-            let mut wan_rows: [HWND; MAX_TARGET_ROWS] = [HWND(std::ptr::null_mut()); 8];
+            let mut wan_rows: [HWND; MAX_WAN_PORTS] = [HWND(std::ptr::null_mut()); 8];
             for i in 0..8 {
                 wan_rows[i] = unsafe {
                     create_ctrl(
@@ -2187,6 +2216,8 @@ unsafe extern "system" fn wnd_proc(
                 edit_up_targets,
                 lbl_down_targets,
                 edit_down_targets,
+                lbl_wan_map,
+                edit_wan_map,
                 btn_conn,
                 btn_up,
                 btn_down,
