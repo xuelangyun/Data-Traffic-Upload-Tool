@@ -22,7 +22,6 @@ windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", feature
     "iptypes",
     "iphlpapi",
     "libloaderapi",
-    "netioapi",
     "ifdef",
     "ipifcons",
     "ntddndis",

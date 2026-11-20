@@ -437,10 +437,6 @@ fn spawn_slot(
                     let rtt = t0.elapsed().as_millis().max(1) as u64;
                     update_rtt_ewma(&stats, rtt);
                     target.metrics.record_rtt(rtt);
-                    if let Ok(local) = s.local_addr() {
-                        let ip = local.ip().to_string();
-                        target.metrics.record_egress(ip);
-                    }
                     s
                 }
                 Ok(Err(e)) => {

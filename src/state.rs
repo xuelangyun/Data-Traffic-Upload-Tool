@@ -1,5 +1,5 @@
-//! Pure in-memory application state, atomic metrics, per-target WAN/speed stats,
-//! ring-buffer logs, speed history for charts, and target defaults.
+//! Pure in-memory application state, atomic metrics, per-target egress stats,
+//! ring-buffer logs, and target defaults.
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -140,7 +140,6 @@ pub struct TargetMetrics {
 
     pub rtt_sum_ms: AtomicU64,
     pub rtt_cnt: AtomicU64,
-    pub egress_map: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl TargetMetrics {
@@ -163,7 +162,6 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
-            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -186,7 +184,6 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
-            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -228,26 +225,7 @@ impl TargetMetrics {
         }
     }
 
-    pub fn record_egress(&self, local_ip: String) {
-        if local_ip.is_empty() || local_ip=="0.0.0.0" { return; }
-        let mut m = self.egress_map.lock();
-        *m.entry(local_ip).or_insert(0) += 1;
-    }
-    pub fn egress_summary(&self) -> String {
-        let m = self.egress_map.lock();
-        if m.is_empty() { return "-".to_string(); }
-        let mut v: Vec<(&String, &usize)> = m.iter().collect();
-        v.sort_by(|a,b| b.1.cmp(a.1));
-        let top = v.into_iter().take(2).map(|(ip,c)| format!("{}({})", ip, c)).collect::<Vec<_>>().join(",");
-        top
-    }
-    pub fn egress_primary_ip(&self) -> String {
-        let m = self.egress_map.lock();
-        if m.is_empty() { return "-".to_string(); }
-        let mut v: Vec<(&String, &usize)> = m.iter().collect();
-        v.sort_by(|a,b| b.1.cmp(a.1));
-        v[0].0.clone()
-    }
+
 }
 
 /// Per-IP endpoint stats under a bandwidth target (for multi-IP / multi-WAN dispersion).
@@ -419,25 +397,17 @@ pub struct TargetDistributionRow {
     pub share: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct WanRow {
-    pub label: String,
-    pub resolved: String,
-    pub egress_ip: String,
-    pub active: usize,
-    pub peak: usize,
-    pub pct: f64,
-    pub rtt: u64,
-    pub share: f64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressIpObservation {
+    pub provider: String,
+    pub ip: String,
 }
 
-/// Rolling speed sample for Win32 GDI charts (500ms per point, up to 120 points = 60s).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SpeedSamplePoint {
-    pub up_bps: u64,
-    pub down_bps: u64,
-    pub nic_up_bps: u64,
-    pub nic_down_bps: u64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressIpRow {
+    pub ip: String,
+    pub hits: usize,
+    pub providers: Vec<String>,
 }
 
 pub struct SharedStats {
@@ -505,21 +475,13 @@ pub struct SharedStats {
     pub down_transfer_ms: AtomicU64,
     pub down_node_metrics: Mutex<Vec<Arc<NodeSpeedMetrics>>>,
 
-    // Windows OS & NIC telemetry
+    // Windows TCP/process telemetry (no network-adapter byte counters)
     pub sys_tcp_estab: AtomicU32,
     pub proc_handles: AtomicU32,
     pub tcp_retrans_pct_x100: AtomicU32,
-    pub nic_up_bps: AtomicU64,
-    pub nic_down_bps: AtomicU64,
-    pub nic_tx_total: AtomicU64,
-    pub nic_rx_total: AtomicU64,
-    pub nic_summary: Mutex<String>,
 
-    // Chart history (up to 120 points = 60s at 500ms)
-    pub speed_history: Mutex<VecDeque<SpeedSamplePoint>>,
-
-    // Public egress IP observations grouped by probe destination; not WAN identities.
-    pub egress_ip_observations: Mutex<String>,
+    // Latest public egress IPs reported by independent external reflectors.
+    pub egress_ip_observations: Mutex<Vec<EgressIpObservation>>,
     pub egress_ip_last_update_ms: AtomicU64,
 }
 
@@ -581,13 +543,7 @@ impl Default for SharedStats {
             sys_tcp_estab: AtomicU32::new(0),
             proc_handles: AtomicU32::new(0),
             tcp_retrans_pct_x100: AtomicU32::new(0),
-            nic_up_bps: AtomicU64::new(0),
-            nic_down_bps: AtomicU64::new(0),
-            nic_tx_total: AtomicU64::new(0),
-            nic_rx_total: AtomicU64::new(0),
-            nic_summary: Mutex::new("网卡检测中...".to_string()),
-            speed_history: Mutex::new(VecDeque::with_capacity(120)),
-            egress_ip_observations: Mutex::new("等待探测".to_string()),
+            egress_ip_observations: Mutex::new(Vec::new()),
             egress_ip_last_update_ms: AtomicU64::new(0),
         }
     }
@@ -660,18 +616,6 @@ impl SharedStats {
         self.down_ttfb_ms.store(0, Ordering::Relaxed);
         self.down_transfer_ms.store(0, Ordering::Relaxed);
         self.down_node_metrics.lock().clear();
-    }
-
-    pub fn reset_speed_history(&self) {
-        self.speed_history.lock().clear();
-    }
-
-    pub fn push_speed_sample(&self, pt: SpeedSamplePoint) {
-        let mut hist = self.speed_history.lock();
-        if hist.len() >= 120 {
-            hist.pop_front();
-        }
-        hist.push_back(pt);
     }
 
     pub fn update_conn_peak(&self, current: usize) {
@@ -823,34 +767,33 @@ impl SharedStats {
         }).collect()
     }
 
-    /// Vertical WAN rows with per-target local egress IP (for table UI)
-    pub fn wan_vertical_rows(&self) -> Vec<WanRow> {
-        let guard = self.target_metrics.lock();
-        let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
-        if healthy.is_empty() {
-            return Vec::new();
-        }
-        let total_active: usize = healthy.iter().map(|t| t.active_conns.load(Ordering::Relaxed)).sum();
-        let mut sorted = healthy;
-        sorted.sort_by(|a,b| b.active_conns.load(Ordering::Relaxed).cmp(&a.active_conns.load(Ordering::Relaxed)));
-        sorted.iter().take(8).map(|t| {
-            let act = t.active_conns.load(Ordering::Relaxed);
-            let peak = t.peak_conns.load(Ordering::Relaxed);
-            let pct = t.orig_success_rate_pct();
-            let rtt = t.avg_rtt_ms();
-            let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
-            let egress_ip = t.egress_primary_ip();
-            WanRow {
-                label: t.label.clone(),
-                resolved: t.resolved_addr.clone(),
-                egress_ip,
-                active: act,
-                peak,
-                pct,
-                rtt,
-                share,
+    /// Aggregate independent public-IP reflector results by observed public IP.
+    /// This identifies distinct egress identities observed by probes, not physical WAN ports.
+    pub fn egress_ip_rows(&self) -> Vec<EgressIpRow> {
+        let observations = self.egress_ip_observations.lock();
+        let mut grouped: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+
+        for observation in observations.iter() {
+            let Ok(ip) = observation.ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                continue;
             }
-        }).collect()
+            grouped.entry(ip.to_string()).or_default().push(observation.provider.clone());
+        }
+
+        let mut rows: Vec<EgressIpRow> = grouped
+            .into_iter()
+            .map(|(ip, mut providers)| {
+                providers.sort();
+                providers.dedup();
+                EgressIpRow { ip, hits: providers.len(), providers }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.ip.cmp(&b.ip)));
+        rows
     }
 
     pub fn node_ranking_summary(nodes: &Mutex<Vec<Arc<NodeSpeedMetrics>>>) -> String {
@@ -1054,10 +997,29 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_p95_and_median() {
-        let vals: Vec<u64> = (1..=20).collect();
-        assert_eq!(compute_p95(&vals), 19);
-        assert_eq!(compute_median(&[10, 50, 20]), 20);
-        assert_eq!(compute_median(&[10, 40, 20, 30]), 25);
+    fn public_egress_observations_are_grouped_by_public_ip() {
+        let stats = SharedStats::default();
+        *stats.egress_ip_observations.lock() = vec![
+            EgressIpObservation { provider: "a.example".to_string(), ip: "203.0.113.10".to_string() },
+            EgressIpObservation { provider: "b.example".to_string(), ip: "203.0.113.10".to_string() },
+            EgressIpObservation { provider: "c.example".to_string(), ip: "198.51.100.20".to_string() },
+            EgressIpObservation { provider: "d.example".to_string(), ip: "2001:db8::10".to_string() },
+            EgressIpObservation { provider: "invalid.example".to_string(), ip: "not-an-ip".to_string() },
+            EgressIpObservation { provider: "loopback.example".to_string(), ip: "127.0.0.1".to_string() },
+        ];
+        let rows = stats.egress_ip_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].ip, "203.0.113.10");
+        assert_eq!(rows[0].hits, 2);
+        assert_eq!(rows[0].providers, vec!["a.example", "b.example"]);
+        assert_eq!(rows[1].ip, "198.51.100.20");
+        assert_eq!(rows[2].ip, "2001:db8::10");
     }
+
+    #[test]
+    fn public_egress_rows_are_empty_when_no_probe_succeeded() {
+        let stats = SharedStats::default();
+        assert!(stats.egress_ip_rows().is_empty());
+    }
+
 }

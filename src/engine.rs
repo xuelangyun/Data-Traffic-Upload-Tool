@@ -2,6 +2,7 @@
 //! Initializes the Tokio thread pool lazily in the background after the Win32 UI paints
 //! so application startup feels instantaneous. Supports duplex (up+down) simultaneous testing.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use tokio::runtime::Runtime;
 
 use crate::conn_tester::{CancelToken, run_conn_test};
 use crate::downloader::run_download_test;
-use crate::state::{AppMode, AppState, SpeedSamplePoint, TestConfig};
+use crate::state::{AppMode, AppState, EgressIpObservation, TestConfig};
 use crate::sys_stats::query_sys_snapshot;
 use crate::uploader::run_upload_test;
 
@@ -62,12 +63,10 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_conn_run();
-        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_conn_rate_sampler(rt, &self.state, cancel.clone());
-        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_conn_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
@@ -85,12 +84,10 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_upload_run();
-        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Uploading, cancel.clone());
-        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_upload_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
@@ -108,12 +105,10 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_download_run();
-        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Downloading, cancel.clone());
-        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_download_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
@@ -132,7 +127,6 @@ impl EngineHandle {
         };
         self.state.stats.reset_upload_run();
         self.state.stats.reset_download_run();
-        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
@@ -140,7 +134,6 @@ impl EngineHandle {
         // so a single Stop click cleans up both directions atomically.
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Uploading, cancel.clone());
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Downloading, cancel.clone());
-        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
 
         rt.spawn(async move {
             let cfg_up = config.clone();
@@ -207,84 +200,69 @@ impl EngineHandle {
     ) {
         let stats = state.stats.clone();
         rt.spawn(async move {
-            let mut last_time = Instant::now();
-            let mut last_bytes: u64 = 0;
-            let mut ema_bps: f64 = 0.0;
+            const SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+            const RATE_WINDOW: Duration = Duration::from_secs(1);
+            const MIN_WINDOW: Duration = Duration::from_millis(750);
+
+            let mut samples: VecDeque<(Instant, u64)> = VecDeque::with_capacity(8);
+            let initial_bytes = match mode {
+                AppMode::Uploading => stats.up_bytes_body_yielded.load(Ordering::Relaxed),
+                AppMode::Downloading => stats.down_bytes_total.load(Ordering::Relaxed),
+                _ => return,
+            };
+            samples.push_back((Instant::now(), initial_bytes));
 
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(SAMPLE_INTERVAL) => {}
                 }
 
                 let now = Instant::now();
-                let elapsed_ns = now.duration_since(last_time).as_nanos() as f64;
-                if elapsed_ns <= 0.0 {
-                    continue;
+                let current_mode = stats.mode();
+                if current_mode != mode && current_mode != AppMode::DuplexTesting {
+                    break;
                 }
 
                 let total = match mode {
-                    AppMode::Uploading => stats.up_bytes_total.load(Ordering::Relaxed),
+                    // This measures bytes yielded by the request-body stream to the HTTP client.
+                    // It is not a NIC counter or a server-side byte acknowledgement.
+                    AppMode::Uploading => stats.up_bytes_body_yielded.load(Ordering::Relaxed),
                     AppMode::Downloading => stats.down_bytes_total.load(Ordering::Relaxed),
                     _ => break,
                 };
 
-                // For duplex mode we still sample individually; the duplex spawn creates two samplers.
-                // If the current global mode is DuplexTesting, let both samplers run.
-                let current_mode = stats.mode();
-                if current_mode != mode && current_mode != AppMode::DuplexTesting {
-                    // Mode changed away from what we sample; continue but don't break immediately
-                    // to allow duplex coordination.
-                    if current_mode == AppMode::Idle {
-                        break;
-                    }
+                if samples.back().is_some_and(|(_, previous)| total < *previous) {
+                    samples.clear();
+                    samples.push_back((now, total));
+                    continue;
                 }
 
-                let delta = total.saturating_sub(last_bytes);
-                last_bytes = total;
-                last_time = now;
-
-                let inst_bps = (delta as f64) * 8.0 * 1_000_000_000.0 / elapsed_ns;
-                ema_bps = if ema_bps <= 0.0 {
-                    inst_bps
-                } else {
-                    ema_bps * 0.45 + inst_bps * 0.55
-                };
-                let smooth_bps = ema_bps.round().max(0.0) as u64;
-
-                match mode {
-                    AppMode::Uploading => {
-                        stats.up_bps_current.store(smooth_bps, Ordering::Relaxed);
-                        stats.update_up_peak(smooth_bps);
-                    }
-                    AppMode::Downloading => {
-                        stats.down_bps_current.store(smooth_bps, Ordering::Relaxed);
-                        stats.update_down_peak(smooth_bps);
-                    }
-                    _ => {}
+                samples.push_back((now, total));
+                while samples.len() > 2
+                    && now.duration_since(samples[1].0) >= RATE_WINDOW
+                {
+                    samples.pop_front();
                 }
-            }
-        });
-    }
 
-    fn spawn_history_sampler(rt: &Runtime, state: &Arc<AppState>, cancel: Arc<CancelToken>) {
-        let stats = state.stats.clone();
-        rt.spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_millis(500));
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => break,
-                    _ = tick.tick() => {}
+                if let Some((started, baseline)) = samples.front().copied() {
+                    let elapsed = now.saturating_duration_since(started);
+                    if elapsed >= MIN_WINDOW {
+                        let rate_bps = calculate_rate_bps(total.saturating_sub(baseline), elapsed);
+                        match mode {
+                            AppMode::Uploading => {
+                                stats.up_bps_current.store(rate_bps, Ordering::Relaxed);
+                                stats.update_up_peak(rate_bps);
+                            }
+                            AppMode::Downloading => {
+                                stats.down_bps_current.store(rate_bps, Ordering::Relaxed);
+                                stats.update_down_peak(rate_bps);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                let pt = SpeedSamplePoint {
-                    up_bps: stats.up_bps_current.load(Ordering::Relaxed),
-                    down_bps: stats.down_bps_current.load(Ordering::Relaxed),
-                    nic_up_bps: stats.nic_up_bps.load(Ordering::Relaxed),
-                    nic_down_bps: stats.nic_down_bps.load(Ordering::Relaxed),
-                };
-                stats.push_speed_sample(pt);
             }
         });
     }
@@ -355,20 +333,6 @@ fn init_runtime_once<'a>(
                 stats_bg
                     .tcp_retrans_pct_x100
                     .store(snap.tcp_retrans_pct_x100, Ordering::Relaxed);
-                stats_bg.nic_up_bps.store(snap.nic_tx_bps, Ordering::Relaxed);
-                stats_bg
-                    .nic_down_bps
-                    .store(snap.nic_rx_bps, Ordering::Relaxed);
-                stats_bg
-                    .nic_tx_total
-                    .store(snap.nic_tx_bytes, Ordering::Relaxed);
-                stats_bg
-                    .nic_rx_total
-                    .store(snap.nic_rx_bytes, Ordering::Relaxed);
-                {
-                    let mut guard = stats_bg.nic_summary.lock();
-                    *guard = snap.nic_summary.clone();
-                }
             }
         });
 
@@ -393,9 +357,9 @@ fn init_runtime_once<'a>(
                 "https://icanhazip.com",
                 "https://ifconfig.me/ip",
                 "https://ipinfo.io/ip",
-                "https://api64.ipify.org",
-                "https://ipv4.icanhazip.com",
-                "https://ipv6.icanhazip.com",
+                "https://ident.me",
+                "https://ifconfig.co/ip",
+                "https://ipecho.net/plain",
             ];
             loop {
                 // Independent destinations can be routed through different WANs by
@@ -414,10 +378,25 @@ fn init_runtime_once<'a>(
                         .await
                         .ok()?
                         .ok()?;
+                        if !response.status().is_success() {
+                            return None;
+                        }
                         let body = response.text().await.ok()?;
+                        if body.len() > 64 {
+                            return None;
+                        }
                         let ip = body.trim().parse::<std::net::IpAddr>().ok()?;
-                        let provider = url.split('/').nth(2).unwrap_or(url);
-                        Some(format!("{provider}={ip}"))
+                        let provider = url
+                            .split('/')
+                            .nth(2)
+                            .unwrap_or(url)
+                            .split('?')
+                            .next()
+                            .unwrap_or(url);
+                        Some(EgressIpObservation {
+                            provider: provider.to_string(),
+                            ip: ip.to_string(),
+                        })
                     });
                 }
                 let mut observations = Vec::new();
@@ -426,11 +405,16 @@ fn init_runtime_once<'a>(
                         observations.push(observation);
                     }
                 }
+                // Keep the previous successful snapshot when every endpoint fails.
+                // A partial successful batch replaces it and is visible with its own hit counts.
                 if !observations.is_empty() {
-                    let summary = observations.join(" | ");
-                    *wan_stats.egress_ip_observations.lock() = summary;
+                    observations.sort_by(|a, b| a.provider.cmp(&b.provider));
+                    *wan_stats.egress_ip_observations.lock() = observations;
                     wan_stats.egress_ip_last_update_ms.store(
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
                         Ordering::Relaxed,
                     );
                 }
@@ -442,6 +426,32 @@ fn init_runtime_once<'a>(
     });
 
     res.as_ref().map_err(String::as_str)
+}
+
+fn calculate_rate_bps(delta_bytes: u64, elapsed: Duration) -> u64 {
+    let nanos = elapsed.as_nanos();
+    if nanos == 0 {
+        return 0;
+    }
+
+    let bits_per_second = (delta_bytes as u128)
+        .saturating_mul(8_000_000_000)
+        .checked_div(nanos)
+        .unwrap_or(0);
+    bits_per_second.min(u64::MAX as u128) as u64
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::calculate_rate_bps;
+    use std::time::Duration;
+
+    #[test]
+    fn rate_uses_elapsed_time_and_bytes_without_ema_lag() {
+        assert_eq!(calculate_rate_bps(1_250_000, Duration::from_secs(1)), 10_000_000);
+        assert_eq!(calculate_rate_bps(625_000, Duration::from_millis(500)), 10_000_000);
+        assert_eq!(calculate_rate_bps(u64::MAX, Duration::ZERO), 0);
+    }
 }
 
 impl Drop for EngineHandle {

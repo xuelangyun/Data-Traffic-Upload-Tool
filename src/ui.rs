@@ -1,7 +1,6 @@
 //! Native Win32 GUI with zero-flicker GDI rendering, Per-Monitor DPI scaling,
-//! Windows system style & font adaptation, custom vector window icon, real-time
-//! speed curves (upload/download/duplex), NIC monitoring, node ranking and
-//! pure in-memory state updates.
+//! Windows system style & font adaptation, connection/bandwidth tables and
+//! source-IP grouped egress distribution.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -34,6 +33,7 @@ const EM_SETSEL: u32 = 0x00B1;
 const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_REPLACESEL: u32 = 0x00C2;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
+const LVM_DELETEITEM_MSG: u32 = 0x1008; // LVM_FIRST + 8
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(((b as u32) << 16) | ((g as u32) << 8) | (r as u32))
@@ -52,15 +52,12 @@ struct LabelCache {
     down_row: String,
     down_detail: String,
     duplex_row: String,
-    nic_row: String,
     rank_row: String,
     wan_ip: String,
-    wan_header: String,
-    wan_rows: [String; 8],
     // Table caches: keep last rendered cell to avoid flicker
     metrics_cells: [[String; 6]; 8],
-    bandwidth_cells: [[String; 6]; 6],
-    wan_cells: [[String; 7]; 8],
+    bandwidth_cells: [[String; 6]; 4],
+    wan_cells: Vec<[String; 3]>,
 }
 
 struct SystemColors {
@@ -512,7 +509,7 @@ struct UiState {
     last_mode_active: Option<bool>,
     log_gen: u64,
     log_seq: u64,
-    chart_rect: RECT,
+    wan_layout_rows: usize,
 
     // Header
     lbl_title: HWND,
@@ -553,9 +550,6 @@ struct UiState {
     grp_wan: HWND,
     lv_wan: HWND,
     lbl_wan_ip: HWND,
-
-    // Chart (no child window clip - painted directly on parent)
-    lbl_chart_title: HWND,
 
     // Log group
     grp_log: HWND,
@@ -636,13 +630,14 @@ unsafe fn lv_insert_column(hwnd: HWND, idx: i32, title: &str, width: i32, fmt: i
 }
 
 unsafe fn lv_insert_row(hwnd: HWND, row: i32) {
+    let mut empty_text = to_wide_null("");
     let mut item = LVITEMW {
         mask: LVIF_TEXT as u32,
         iItem: row,
         iSubItem: 0,
         state: 0,
         stateMask: 0,
-        pszText: PWSTR(to_wide_null("").as_ptr() as *mut u16),
+        pszText: PWSTR(empty_text.as_mut_ptr()),
         cchTextMax: 0,
         iImage: 0,
         lParam: LPARAM(0),
@@ -654,6 +649,17 @@ unsafe fn lv_insert_row(hwnd: HWND, row: i32) {
         iGroup: 0,
     };
     let _ = unsafe { SendMessageW(hwnd, LVM_INSERTITEMW as u32, WPARAM(0), LPARAM(&mut item as *mut _ as isize)) };
+}
+
+unsafe fn lv_delete_row(hwnd: HWND, row: i32) {
+    let _ = unsafe {
+        SendMessageW(
+            hwnd,
+            LVM_DELETEITEM_MSG,
+            WPARAM(row as usize),
+            LPARAM(0),
+        )
+    };
 }
 
 unsafe fn lv_set_cell(hwnd: HWND, row: i32, col: i32, text: &str) {
@@ -760,7 +766,6 @@ impl UiState {
             set_font(self.grp_wan, t.font_bold);
             set_font(self.lbl_wan_ip, t.font_small);
             set_font(self.lv_wan, t.font_small);
-            set_font(self.lbl_chart_title, t.font_bold);
             set_font(self.grp_log, t.font_bold);
             set_font(self.edit_log, t.font_log);
         }
@@ -846,16 +851,16 @@ impl UiState {
         defer_bottom(&mut hdwp, self.grp_metrics, margin, metrics_top, w, metrics_h);
         defer(&mut hdwp, self.lv_metrics, cfg_x, metrics_top + metrics_title_off, cfg_inner_w, metrics_h - metrics_title_off - s(4));
         y = metrics_top + metrics_h + s(6);
-        // Bandwidth table: 5 rows
+        // Bandwidth table: upload, download, duplex and ranking
         let bw_top = y;
-        let bw_rows = 5;
+        let bw_rows = 4;
         let bw_h = metrics_title_off + s(22) + bw_rows * small_row_h + s(8);
         defer_bottom(&mut hdwp, self.grp_bandwidth, margin, bw_top, w, bw_h);
         defer(&mut hdwp, self.lv_bandwidth, cfg_x, bw_top + metrics_title_off, cfg_inner_w, bw_h - metrics_title_off - s(4));
         y = bw_top + bw_h + s(6);
-        // WAN table: header + up to 8 rows
+        // WAN table: grow vertically with the number of unique public egress IPs.
         let wan_top = y;
-        let wan_rows = 8;
+        let wan_rows = self.wan_layout_rows.max(1) as i32;
         let wan_h = metrics_title_off + small_row_h + s(22) + wan_rows * small_row_h + s(8);
         defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h);
         // Inside WAN: lbl_wan_ip small row at top of inner area, then ListView occupies rest
@@ -863,13 +868,6 @@ impl UiState {
         defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wan_inner_y, cfg_inner_w, small_row_h);
         defer(&mut hdwp, self.lv_wan, cfg_x, wan_inner_y + small_row_h + s(2), cfg_inner_w, wan_h - metrics_title_off - small_row_h - s(6));
         y = wan_top + wan_h + s(6);
-        // Chart
-        let chart_title_h = lh + s(4);
-        defer(&mut hdwp, self.lbl_chart_title, margin, y, w, chart_title_h);
-        y += chart_title_h + s(4);
-        let chart_h = s(130).max(lh * 7 + s(12));
-        self.chart_rect = RECT { left: margin + s(2), top: y, right: margin + w - s(2), bottom: y + chart_h };
-        y = y + chart_h + s(6);
         // Log
         let log_top = y;
         let log_h = (height - log_top - s(6)).max(s(90));
@@ -1019,15 +1017,8 @@ impl UiState {
         let tcp_ms = stats.down_tcp_ms.load(Ordering::Relaxed);
         let tls_ms = stats.down_tls_ms.load(Ordering::Relaxed);
         let ttfb_ms = stats.down_ttfb_ms.load(Ordering::Relaxed);
-        let nic_tx = stats.nic_tx_total.load(Ordering::Relaxed);
-        let nic_rx = stats.nic_rx_total.load(Ordering::Relaxed);
-        let nic_up = stats.nic_up_bps.load(Ordering::Relaxed);
-        let nic_down = stats.nic_down_bps.load(Ordering::Relaxed);
-        let nic_summary = stats.nic_summary.lock().clone();
         let up_rank = crate::state::SharedStats::node_ranking_summary(&stats.up_node_metrics);
         let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
-        let egress_ips = crate::sys_stats::query_egress_local_ips();
-        let wan_ip_raw = stats.egress_ip_observations.lock().clone();
 
         // Helper to update ListView cell with cache check (prevent jitter)
         let mut set_lv_cell = |hwnd: HWND, row: i32, col: i32, cache: &mut String, next: String| {
@@ -1086,100 +1077,130 @@ impl UiState {
             set_lv_cell(lv, 4, 5, &mut self.cache.metrics_cells[4][5], format!("补建{rep_ok}/{rep_att} 失败本机{f_loc} 远拒{f_ref} 远闭{f_rem} 超时{f_to}"));
             // Row5 上行
             set_lv_cell(lv, 5, 0, &mut self.cache.metrics_cells[5][0], "上行".to_string());
-            set_lv_cell(lv, 5, 1, &mut self.cache.metrics_cells[5][1], "实时".to_string());
+            set_lv_cell(lv, 5, 1, &mut self.cache.metrics_cells[5][1], "近1秒".to_string());
             set_lv_cell(lv, 5, 2, &mut self.cache.metrics_cells[5][2], format_mbps(up_bps));
             set_lv_cell(lv, 5, 3, &mut self.cache.metrics_cells[5][3], format_mbps(up_peak));
             set_lv_cell(lv, 5, 4, &mut self.cache.metrics_cells[5][4], format!("{up_fail:.1}%/{}err", up_err));
             set_lv_cell(lv, 5, 5, &mut self.cache.metrics_cells[5][5], format!("并发{up_cur_c}(最佳{up_best_c}) 流{up_streams} 平均{} P95{}", format_mbps(up_avg), format_mbps(up_p95)));
             // Row6 下行
             set_lv_cell(lv, 6, 0, &mut self.cache.metrics_cells[6][0], "下行".to_string());
-            set_lv_cell(lv, 6, 1, &mut self.cache.metrics_cells[6][1], "实时".to_string());
+            set_lv_cell(lv, 6, 1, &mut self.cache.metrics_cells[6][1], "近1秒".to_string());
             set_lv_cell(lv, 6, 2, &mut self.cache.metrics_cells[6][2], format_mbps(down_bps));
             set_lv_cell(lv, 6, 3, &mut self.cache.metrics_cells[6][3], format_mbps(down_peak));
             set_lv_cell(lv, 6, 4, &mut self.cache.metrics_cells[6][4], format!("{down_fail:.1}%/{}err", down_err));
             set_lv_cell(lv, 6, 5, &mut self.cache.metrics_cells[6][5], format!("并发{down_cur_c}(最佳{down_best_c}) 流{down_streams} 平均{} P95{}", format_mbps(down_avg), format_mbps(down_p95)));
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
         }
-        // Bandwidth table: 5 rows, 6 cols
+        // Bandwidth table: application-layer rolling rate and effective totals.
         {
             let lv = self.lv_bandwidth;
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
-            // Row0 上行详情
+            // Upload current: body bytes yielded to the HTTP client in the latest ~1s window.
             set_lv_cell(lv, 0, 0, &mut self.cache.bandwidth_cells[0][0], "上行".to_string());
             set_lv_cell(lv, 0, 1, &mut self.cache.bandwidth_cells[0][1], format_mbps(up_bps));
             set_lv_cell(lv, 0, 2, &mut self.cache.bandwidth_cells[0][2], format_mbps(up_peak));
-            set_lv_cell(lv, 0, 3, &mut self.cache.bandwidth_cells[0][3], format!("{} P95:{}", format_mbps(up_avg), format_mbps(up_p95)));
+            set_lv_cell(lv, 0, 3, &mut self.cache.bandwidth_cells[0][3], format!("{} / P95 {}", format_mbps(up_avg), format_mbps(up_p95)));
             set_lv_cell(lv, 0, 4, &mut self.cache.bandwidth_cells[0][4], format_bytes(up_total));
-            set_lv_cell(lv, 0, 5, &mut self.cache.bandwidth_cells[0][5], format!("延迟{up_lat}ms 重传{retrans_pct:.2}% NIC{}", format_mbps(nic_up)));
-            // Row1 下行详情
+            set_lv_cell(lv, 0, 5, &mut self.cache.bandwidth_cells[0][5], format!("实时/峰值为请求体供给；均值/P95/累计仅计完整2xx · 延迟{up_lat}ms"));
+
+            // Download current: actual response bytes read in the latest ~1s window.
             set_lv_cell(lv, 1, 0, &mut self.cache.bandwidth_cells[1][0], "下行".to_string());
             set_lv_cell(lv, 1, 1, &mut self.cache.bandwidth_cells[1][1], format_mbps(down_bps));
             set_lv_cell(lv, 1, 2, &mut self.cache.bandwidth_cells[1][2], format_mbps(down_peak));
-            set_lv_cell(lv, 1, 3, &mut self.cache.bandwidth_cells[1][3], format!("{} P95:{}", format_mbps(down_avg), format_mbps(down_p95)));
+            set_lv_cell(lv, 1, 3, &mut self.cache.bandwidth_cells[1][3], format!("{} / P95 {}", format_mbps(down_avg), format_mbps(down_p95)));
             set_lv_cell(lv, 1, 4, &mut self.cache.bandwidth_cells[1][4], format_bytes(down_total));
-            set_lv_cell(lv, 1, 5, &mut self.cache.bandwidth_cells[1][5], format!("TCP{tcp_ms} TLS{tls_ms} TTFB{ttfb_ms} NIC{}", format_mbps(nic_down)));
-            // Row2 双向
-            let duplex_val = if mode==AppMode::DuplexTesting { format_mbps(up_bps+down_bps) } else { "-".to_string() };
-            let duplex_peak = format_mbps(up_peak+down_peak);
+            set_lv_cell(lv, 1, 5, &mut self.cache.bandwidth_cells[1][5], format!("实际读取 · TCP{tcp_ms} TLS{tls_ms} TTFB{ttfb_ms}"));
+
+            // Duplex summary.
+            let duplex_val = if mode == AppMode::DuplexTesting {
+                format_mbps(up_bps.saturating_add(down_bps))
+            } else {
+                "-".to_string()
+            };
             set_lv_cell(lv, 2, 0, &mut self.cache.bandwidth_cells[2][0], "双向".to_string());
             set_lv_cell(lv, 2, 1, &mut self.cache.bandwidth_cells[2][1], duplex_val);
-            set_lv_cell(lv, 2, 2, &mut self.cache.bandwidth_cells[2][2], duplex_peak);
-            set_lv_cell(lv, 2, 3, &mut self.cache.bandwidth_cells[2][3], format_mbps(up_avg+down_avg));
-            set_lv_cell(lv, 2, 4, &mut self.cache.bandwidth_cells[2][4], format!("上{} 下{}", format_mbps(nic_up), format_mbps(nic_down)));
-            set_lv_cell(lv, 2, 5, &mut self.cache.bandwidth_cells[2][5], if mode==AppMode::DuplexTesting { "并发压测中" } else { "空闲" }.to_string());
-            // Row3 网卡
-            set_lv_cell(lv, 3, 0, &mut self.cache.bandwidth_cells[3][0], "网卡".to_string());
-            set_lv_cell(lv, 3, 1, &mut self.cache.bandwidth_cells[3][1], format_mbps(nic_up));
-            set_lv_cell(lv, 3, 2, &mut self.cache.bandwidth_cells[3][2], format_mbps(nic_down));
-            set_lv_cell(lv, 3, 3, &mut self.cache.bandwidth_cells[3][3], format!("{}/s", nic_summary.clone()));
-            set_lv_cell(lv, 3, 4, &mut self.cache.bandwidth_cells[3][4], format!("发{} 收{}", format_bytes(nic_tx), format_bytes(nic_rx)));
-            set_lv_cell(lv, 3, 5, &mut self.cache.bandwidth_cells[3][5], nic_summary.clone());
-            // Row4 节点排名
-            set_lv_cell(lv, 4, 0, &mut self.cache.bandwidth_cells[4][0], "排名".to_string());
-            set_lv_cell(lv, 4, 1, &mut self.cache.bandwidth_cells[4][1], up_rank.clone());
-            set_lv_cell(lv, 4, 2, &mut self.cache.bandwidth_cells[4][2], down_rank.clone());
-            set_lv_cell(lv, 4, 3, &mut self.cache.bandwidth_cells[4][3], "-".to_string());
-            set_lv_cell(lv, 4, 4, &mut self.cache.bandwidth_cells[4][4], "-".to_string());
-            set_lv_cell(lv, 4, 5, &mut self.cache.bandwidth_cells[4][5], format!("上{} 下{}", up_rank, down_rank));
+            set_lv_cell(lv, 2, 2, &mut self.cache.bandwidth_cells[2][2], format_mbps(up_peak.saturating_add(down_peak)));
+            set_lv_cell(lv, 2, 3, &mut self.cache.bandwidth_cells[2][3], format_mbps(up_avg.saturating_add(down_avg)));
+            set_lv_cell(lv, 2, 4, &mut self.cache.bandwidth_cells[2][4], format!("上{} 下{}", format_bytes(up_total), format_bytes(down_total)));
+            set_lv_cell(lv, 2, 5, &mut self.cache.bandwidth_cells[2][5], if mode == AppMode::DuplexTesting { "并发压测中" } else { "空闲" }.to_string());
+
+            // Best nodes.
+            set_lv_cell(lv, 3, 0, &mut self.cache.bandwidth_cells[3][0], "节点".to_string());
+            set_lv_cell(lv, 3, 1, &mut self.cache.bandwidth_cells[3][1], up_rank.clone());
+            set_lv_cell(lv, 3, 2, &mut self.cache.bandwidth_cells[3][2], down_rank.clone());
+            set_lv_cell(lv, 3, 3, &mut self.cache.bandwidth_cells[3][3], "-".to_string());
+            set_lv_cell(lv, 3, 4, &mut self.cache.bandwidth_cells[3][4], "-".to_string());
+            set_lv_cell(lv, 3, 5, &mut self.cache.bandwidth_cells[3][5], format!("上行 {} · 下行 {}", up_rank, down_rank));
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
         }
-        // WAN ListView + header IP line with async alignment
-        let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw=="检测中..." { "检测中...".to_string() } else { wan_ip_raw.clone() };
+        // Group the latest external reflector responses by their observed public egress IP.
         let wan_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
-            if last==0 {"".to_string()} else {
-                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                let secs = now_ms.saturating_sub(last)/1000;
-                if secs < 120 { format!(" · {}s前", secs) } else { format!(" · {}m前", secs/60) }
+            if last == 0 {
+                "尚未成功探测".to_string()
+            } else {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let secs = now_ms.saturating_sub(last) / 1000;
+                if secs < 120 { format!("{secs}s 前更新") } else { format!("{}m 前更新", secs / 60) }
             }
         };
-        let local_egress = if egress_ips.is_empty() { "未检测到".to_string() } else { egress_ips.join(", ") };
-        let wan_ip_text = format!("本机出口(本地): {} | 公网: {} (每35s{}) | 动态自适应", local_egress, wan_ip_disp, wan_age);
-        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_ip_text) };
-        // Update WAN table rows
-        let wan_rows = stats.wan_vertical_rows();
+
+        let wan_rows = stats.egress_ip_rows();
+        let probe_hits: usize = wan_rows.iter().map(|row| row.hits).sum();
+        let wan_summary = format!(
+            "发现 {} 个公网 IP · {} 次服务响应 · {}",
+            wan_rows.len(),
+            probe_hits,
+            wan_age
+        );
+        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_summary) };
+
+        let desired_rows = wan_rows.len().max(1);
         {
             let lv = self.lv_wan;
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
-            for idx in 0..8 {
-                if idx < wan_rows.len() {
-                    let r = &wan_rows[idx];
-                    set_lv_cell(lv, idx as i32, 0, &mut self.cache.wan_cells[idx][0], format!("{}", idx+1));
-                    set_lv_cell(lv, idx as i32, 1, &mut self.cache.wan_cells[idx][1], r.label.clone());
-                    set_lv_cell(lv, idx as i32, 2, &mut self.cache.wan_cells[idx][2], if r.egress_ip=="-" { r.resolved.clone() } else { r.egress_ip.clone() });
-                    set_lv_cell(lv, idx as i32, 3, &mut self.cache.wan_cells[idx][3], format!("{}/{}", r.active, r.peak));
-                    set_lv_cell(lv, idx as i32, 4, &mut self.cache.wan_cells[idx][4], format!("{:.1}%", r.pct));
-                    set_lv_cell(lv, idx as i32, 5, &mut self.cache.wan_cells[idx][5], format!("{}ms", r.rtt));
-                    set_lv_cell(lv, idx as i32, 6, &mut self.cache.wan_cells[idx][6], format!("{:.1}%", r.share));
-                } else {
-                    let placeholder = if stats.mode()==crate::state::AppMode::Idle && idx==0 { "(空闲 — 开始测试后显示)" } else if wan_rows.is_empty() && idx==0 { "等待健康检查..." } else { "" };
-                    for col in 0..7 {
-                        let txt = if col==1 { placeholder.to_string() } else { "".to_string() };
-                        set_lv_cell(lv, idx as i32, col as i32, &mut self.cache.wan_cells[idx][col as usize], txt);
+
+            // Dynamic ListView items: one row per unique public egress IP.
+            while self.cache.wan_cells.len() < desired_rows {
+                let row_idx = self.cache.wan_cells.len();
+                unsafe { lv_insert_row(lv, row_idx as i32) };
+                self.cache.wan_cells.push(std::array::from_fn(|_| String::new()));
+            }
+            while self.cache.wan_cells.len() > desired_rows {
+                let row_idx = self.cache.wan_cells.len() - 1;
+                unsafe { lv_delete_row(lv, row_idx as i32) };
+                self.cache.wan_cells.pop();
+            }
+
+            if wan_rows.is_empty() {
+                let values = ["等待公网 IP 探测", "-", "查询服务暂不可用时保留上次成功结果"];
+                for (col, value) in values.iter().enumerate() {
+                    set_lv_cell(lv, 0, col as i32, &mut self.cache.wan_cells[0][col], (*value).to_string());
+                }
+            } else {
+                for (idx, row) in wan_rows.iter().enumerate() {
+                    let values = [
+                        row.ip.clone(),
+                        format!("{} 个", row.hits),
+                        row.providers.join(" · "),
+                    ];
+                    for (col, value) in values.iter().enumerate() {
+                        set_lv_cell(
+                            lv,
+                            idx as i32,
+                            col as i32,
+                            &mut self.cache.wan_cells[idx][col],
+                            value.clone(),
+                        );
                     }
                 }
             }
+
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
+            let _ = unsafe { InvalidateRect(Some(lv), None, true) };
         }
 
         // Delta-append memory ring buffer log
@@ -1226,197 +1247,6 @@ impl UiState {
         self.log_gen = new_gen;
         self.log_seq = new_seq;
     }
-}
-
-/// Draw bandwidth chart inside given rect using GDI (caller provides HDC from BeginPaint)
-unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::state::SharedStats, theme: &ThemeResources) {
-    let rc = chart_rect;
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
-    if w <= 20 || h <= 20 {
-        return;
-    }
-
-    // Create memory DC for double-buffer to avoid flicker
-    let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
-    let mem_bmp = unsafe { CreateCompatibleBitmap(hdc, w, h) };
-    if mem_dc.0.is_null() || mem_bmp.0.is_null() {
-        if !mem_dc.0.is_null() { let _ = unsafe { DeleteDC(mem_dc) }; }
-        if !mem_bmp.0.is_null() { let _ = unsafe { DeleteObject(HGDIOBJ(mem_bmp.0)) }; }
-        return;
-    }
-    let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(mem_bmp.0)) };
-
-    // Fill background with card color
-    let mut fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
-    let _ = unsafe { FillRect(mem_dc, &fill_rc, theme.brush_card) };
-
-    // Border
-    let pen_border = unsafe { CreatePen(PS_SOLID, 1, rgb(200, 200, 200)) };
-    let old_pen = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_border.0)) };
-    let old_brush = unsafe { SelectObject(mem_dc, HGDIOBJ(GetStockObject(NULL_BRUSH).0)) };
-    let _ = unsafe { Rectangle(mem_dc, 0, 0, w, h) };
-
-    // Chart inner area with padding for labels
-    let pad_l = scale_px(48, theme.dpi);
-    let pad_r = scale_px(10, theme.dpi);
-    let pad_t = scale_px(12, theme.dpi);
-    let pad_b = scale_px(18, theme.dpi);
-    let chart_l = pad_l;
-    let chart_t = pad_t;
-    let chart_r = w - pad_r;
-    let chart_b = h - pad_b;
-    let chart_w = (chart_r - chart_l).max(1);
-    let chart_h = (chart_b - chart_t).max(1);
-
-    // Determine max Y from history
-    let hist = stats.speed_history.lock().clone();
-    let mut max_bps: u64 = 10_000_000; // at least 10 Mbps visible
-    for pt in hist.iter() {
-        max_bps = max_bps.max(pt.up_bps).max(pt.down_bps).max(pt.nic_up_bps).max(pt.nic_down_bps);
-    }
-    max_bps = max_bps.max(stats.up_bps_peak.load(Ordering::Relaxed)).max(stats.down_bps_peak.load(Ordering::Relaxed));
-    max_bps = ((max_bps as f64) * 1.2) as u64;
-    if max_bps < 5_000_000 { max_bps = 5_000_000; }
-    let max_mbps = (max_bps as f64) / 1_000_000.0;
-
-    // Grid lines (4 horizontal)
-    let pen_grid = unsafe { CreatePen(PS_DOT, 1, rgb(220, 220, 220)) };
-    let _ = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_grid.0)) };
-    for i in 1..4 {
-        let y = chart_t + (chart_h * i as i32) / 4;
-        let _ = unsafe { MoveToEx(mem_dc, chart_l, y, None) };
-        let _ = unsafe { LineTo(mem_dc, chart_r, y) };
-    }
-
-    // Y-axis labels
-    let _ = unsafe { SelectObject(mem_dc, HGDIOBJ(theme.font_small.0)) };
-    let _ = unsafe { SetBkMode(mem_dc, TRANSPARENT) };
-    let _ = unsafe { SetTextColor(mem_dc, theme.colors.text_muted) };
-    for i in 0..=4 {
-        let frac = (4 - i as i32) as f64 / 4.0;
-        let mbps = max_mbps * frac;
-        let label = if mbps >= 100.0 { format!("{mbps:.0}") } else { format!("{mbps:.1}") };
-        let y = chart_t + (chart_h * i as i32) / 4 - scale_px(6, theme.dpi);
-        let mut tr = RECT { left: scale_px(2, theme.dpi), top: y, right: pad_l - scale_px(2, theme.dpi), bottom: y + scale_px(14, theme.dpi) };
-        let wide = to_wide_null(&label);
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_RIGHT | DT_SINGLELINE) as u32) };
-    }
-    // X-axis time labels (0s .. 60s)
-    for i in 0..=3 {
-        let x = chart_l + (chart_w * i as i32) / 3;
-        let secs = (60 * i as i32) / 3;
-        let label = format!("{secs}s");
-        let wide = to_wide_null(&label);
-        let mut tr = RECT { left: x - scale_px(14, theme.dpi), top: chart_b + scale_px(2, theme.dpi), right: x + scale_px(14, theme.dpi), bottom: chart_b + scale_px(14, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_CENTER | DT_SINGLELINE) as u32) };
-    }
-
-    // Helper to plot a series
-    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: i32| {
-        if points.len() < 2 { return; }
-        let pen = unsafe { CreatePen(style, width, color) };
-        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
-        let mut first = true;
-        for (x_frac, y_frac) in points {
-            let x = chart_l + (chart_w as f64 * x_frac) as i32;
-            let y = chart_b - (chart_h as f64 * y_frac) as i32;
-            if first {
-                let _ = unsafe { MoveToEx(mem_dc, x, y, None) };
-                first = false;
-            } else {
-                let _ = unsafe { LineTo(mem_dc, x, y) };
-            }
-        }
-        let _ = unsafe { SelectObject(mem_dc, old) };
-        let _ = unsafe { DeleteObject(HGDIOBJ(pen.0)) };
-    };
-
-    if !hist.is_empty() {
-        let max_f = max_bps as f64;
-
-        let up_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
-            let xf = (i as f64) / 119.0; // 120 points span
-            let yf = (pt.up_bps as f64) / max_f;
-            (xf, yf.clamp(0.0, 1.0))
-        }).collect();
-        let down_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
-            let xf = (i as f64) / 119.0;
-            let yf = (pt.down_bps as f64) / max_f;
-            (xf, yf.clamp(0.0, 1.0))
-        }).collect();
-        let nic_up_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
-            let xf = (i as f64) / 119.0;
-            let yf = (pt.nic_up_bps as f64) / max_f;
-            (xf, yf.clamp(0.0, 1.0))
-        }).collect();
-        let nic_down_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
-            let xf = (i as f64) / 119.0;
-            let yf = (pt.nic_down_bps as f64) / max_f;
-            (xf, yf.clamp(0.0, 1.0))
-        }).collect();
-
-        // Up: orange solid 2px
-        plot_series(mem_dc, up_pts, rgb(234, 88, 12), 2, PS_SOLID);
-        // Down: blue solid 2px
-        plot_series(mem_dc, down_pts, rgb(37, 99, 235), 2, PS_SOLID);
-        // Duplex combined: green if active (sum)
-        if stats.mode() == AppMode::DuplexTesting {
-            let duplex_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
-                let xf = (i as f64) / 119.0;
-                let yf = ((pt.up_bps + pt.down_bps) as f64 / max_f).clamp(0.0, 1.0);
-                (xf, yf)
-            }).collect();
-            plot_series(mem_dc, duplex_pts, rgb(5, 122, 85), 2, PS_SOLID);
-        }
-        // NIC up: orange dashed
-        plot_series(mem_dc, nic_up_pts, rgb(180, 120, 40), 1, PS_DOT);
-        // NIC down: blue dashed
-        plot_series(mem_dc, nic_down_pts, rgb(100, 130, 180), 1, PS_DOT);
-    }
-
-    // Legend at top-right inside chart
-    let legend_items: Vec<(&str, COLORREF)> = vec![
-        ("上行", rgb(234,88,12)),
-        ("下行", rgb(37,99,235)),
-        ("双向合计", rgb(5,122,85)),
-        ("网卡上行(虚线)", rgb(180,120,40)),
-        ("网卡下行(虚线)", rgb(100,130,180)),
-    ];
-    let mut lx = chart_r - scale_px(260, theme.dpi);
-    let ly = chart_t + scale_px(4, theme.dpi);
-    for (label, color) in legend_items {
-        // color box
-        let pen = unsafe { CreatePen(PS_SOLID, 2, color) };
-        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
-        let bx1 = lx;
-        let by1 = ly;
-        let bx2 = lx + scale_px(12, theme.dpi);
-        let by2 = ly + scale_px(4, theme.dpi);
-        let _ = unsafe { MoveToEx(mem_dc, bx1, (by1+by2)/2, None) };
-        let _ = unsafe { LineTo(mem_dc, bx2, (by1+by2)/2) };
-        let _ = unsafe { SelectObject(mem_dc, old) };
-        let _ = unsafe { DeleteObject(HGDIOBJ(pen.0)) };
-        // text
-        let wide = to_wide_null(label);
-        let mut tr = RECT { left: bx2 + scale_px(4, theme.dpi), top: ly - scale_px(6, theme.dpi), right: bx2 + scale_px(60, theme.dpi), bottom: ly + scale_px(8, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_LEFT | DT_SINGLELINE) as u32) };
-        lx += scale_px(52, theme.dpi);
-        if label.len() > 8 { lx += scale_px(20, theme.dpi); }
-    }
-
-    // Restore and blit
-    let _ = unsafe { SelectObject(mem_dc, old_pen) };
-    let _ = unsafe { SelectObject(mem_dc, old_brush) };
-    let _ = unsafe { DeleteObject(HGDIOBJ(pen_border.0)) };
-    let _ = unsafe { DeleteObject(HGDIOBJ(pen_grid.0)) };
-
-    // Blit to screen at chart_rect origin
-    let _ = unsafe { BitBlt(hdc, rc.left, rc.top, w, h, Some(mem_dc), 0, 0, SRCCOPY) };
-
-    let _ = unsafe { SelectObject(mem_dc, old_bmp) };
-    let _ = unsafe { DeleteObject(HGDIOBJ(mem_bmp.0)) };
-    let _ = unsafe { DeleteDC(mem_dc) };
 }
 
 pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String> {
@@ -1902,45 +1732,26 @@ unsafe extern "system" fn wnd_proc(
             unsafe {
                 let total_w = 860;
                 lv_insert_column(lv_bandwidth, 0, "类型", total_w*12/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_bandwidth, 1, "实时", total_w*15/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_bandwidth, 1, "近1秒", total_w*15/100, LVCFMT_RIGHT as i32);
                 lv_insert_column(lv_bandwidth, 2, "峰值", total_w*13/100, LVCFMT_RIGHT as i32);
                 lv_insert_column(lv_bandwidth, 3, "平均/P95", total_w*16/100, LVCFMT_RIGHT as i32);
-                lv_insert_column(lv_bandwidth, 4, "累计/并发", total_w*18/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_bandwidth, 5, "详情", total_w*26/100, LVCFMT_LEFT as i32);
-                for r in 0..5 { lv_insert_row(lv_bandwidth, r); }
+                lv_insert_column(lv_bandwidth, 4, "累计/流量", total_w*18/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_bandwidth, 5, "测量口径", total_w*26/100, LVCFMT_LEFT as i32);
+                for r in 0..4 { lv_insert_row(lv_bandwidth, r); }
             }
             let grp_bandwidth = unsafe {
-                create_ctrl(w!("BUTTON"), " 宽带详情 · 网卡对比 · 节点排名 (表格) ", grp_style, 0, hwnd, 0, hinst, theme.font_bold)
+                create_ctrl(w!("BUTTON"), " 宽带详情（近1秒速率） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold)
             };
 
-            let lbl_wan_ip = unsafe { create_ctrl(w!("STATIC"), "出口公网IP: 检测中...", st_left, 0, hwnd, 0, hinst, theme.font_small) };
+            let lbl_wan_ip = unsafe { create_ctrl(w!("STATIC"), "公网出口 IP 探测中...", st_left, 0, hwnd, 0, hinst, theme.font_small) };
             let lv_wan = unsafe { create_listview(hwnd, hinst, theme.font_small) };
             unsafe {
                 let total_w = 860;
-                lv_insert_column(lv_wan, 0, "#", total_w*5/100, LVCFMT_CENTER as i32);
-                lv_insert_column(lv_wan, 1, "目标(出口标识)", total_w*24/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_wan, 2, "本地出口IP", total_w*18/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_wan, 3, "存活/峰值", total_w*13/100, LVCFMT_CENTER as i32);
-                lv_insert_column(lv_wan, 4, "成功率", total_w*10/100, LVCFMT_RIGHT as i32);
-                lv_insert_column(lv_wan, 5, "RTT", total_w*8/100, LVCFMT_RIGHT as i32);
-                lv_insert_column(lv_wan, 6, "占比", total_w*9/100, LVCFMT_RIGHT as i32);
-                for r in 0..8 { lv_insert_row(lv_wan, r); }
+                lv_insert_column(lv_wan, 0, "公网出口 IP", total_w*22/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 1, "命中服务", total_w*14/100, LVCFMT_CENTER as i32);
+                lv_insert_column(lv_wan, 2, "探测来源", total_w*64/100, LVCFMT_LEFT as i32);
             }
-            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 出口分布 (表格·自动推测·竖排) ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
-
-            // Chart title (static bold) - chart body painted on parent DC
-            let lbl_chart_title = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "实时速度曲线 (上行·下行·双向合计 vs 网卡实际流量)  —— 60秒历史 · 格栅坐标",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
+            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 公网出口 IP（相同 IP 合并） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
 
             // Inner control for Log (created BEFORE grp_log)
             let edit_log = unsafe {
@@ -1972,7 +1783,7 @@ unsafe extern "system" fn wnd_proc(
             let mut ui = Box::new(UiState {
                 app, engine, theme,
                 cache: LabelCache::default(),
-                last_mode_active: None, log_gen: 0, log_seq: 0, chart_rect: RECT::default(),
+                last_mode_active: None, log_gen: 0, log_seq: 0, wan_layout_rows: 1,
                 lbl_title, lbl_status, lbl_mem_badge,
                 grp_config, lbl_streams, edit_streams, lbl_max_conns, edit_max_conns, lbl_hold_secs, edit_hold_secs, chk_continuous,
                 lbl_tcp_targets, edit_tcp_targets, lbl_up_targets, edit_up_targets, lbl_down_targets, edit_down_targets,
@@ -1980,7 +1791,6 @@ unsafe extern "system" fn wnd_proc(
                 grp_metrics, lv_metrics,
                 grp_bandwidth, lv_bandwidth,
                 grp_wan, lv_wan, lbl_wan_ip,
-                lbl_chart_title,
                 grp_log, edit_log,
             });
 
@@ -2083,19 +1893,6 @@ unsafe extern "system" fn wnd_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        m if m == WM_PAINT as u32 => {
-            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
-            if !ptr.is_null() {
-                let ui = unsafe { &*ptr };
-                if ui.chart_rect.right > ui.chart_rect.left && ui.chart_rect.bottom > ui.chart_rect.top {
-                    unsafe { paint_speed_chart_on_hdc(hdc, ui.chart_rect, &ui.app.stats, &ui.theme) };
-                }
-            }
-            let _ = unsafe { EndPaint(hwnd, &ps) };
-            return LRESULT(0);
-        }
         m if m == WM_DPICHANGED as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
             if !ptr.is_null() {
@@ -2145,11 +1942,14 @@ unsafe extern "system" fn wnd_proc(
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
                 if !ptr.is_null() {
                     let ui = unsafe { &mut *ptr };
-                    unsafe { ui.refresh_metrics_and_logs() };
-                    // Invalidate chart area to repaint curves each tick
-                    if ui.chart_rect.right > ui.chart_rect.left {
-                        let _ = unsafe { InvalidateRect(Some(hwnd), Some(&ui.chart_rect), false) };
+                    let next_wan_rows = ui.app.stats.egress_ip_rows().len().max(1);
+                    if next_wan_rows != ui.wan_layout_rows {
+                        ui.wan_layout_rows = next_wan_rows;
+                        let mut client_rect = RECT::default();
+                        let _ = unsafe { GetClientRect(hwnd, &mut client_rect) };
+                        unsafe { ui.layout(client_rect.right - client_rect.left, client_rect.bottom - client_rect.top) };
                     }
+                    unsafe { ui.refresh_metrics_and_logs() };
                 }
             }
             LRESULT(0)
@@ -2191,16 +1991,10 @@ unsafe extern "system" fn wnd_proc(
                     }
                     ID_BTN_HELP => {
                         let help_text = concat!(
-                            "1. 纯内存原则：配置、统计和日志全部保存在进程内存中，退出即销毁，不读写本地磁盘或注册表。\n\n",
-                            "2. 测速准确性：\n",
-                            "  · 上行严格区分【生成数据量/客户端发送量/服务端确认接收量】，仅服务端确认量计入有效速率；\n",
-                            "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
-                            "  · 失败请求独立统计，不计入成功率分母。\n\n",
-                            "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
-                            "4. 多 WAN 说明：单条 TCP 连接仅走单条出口，多目标并发才会分散至多条线路；本工具按独立 IP 列表原子轮询分散连接，并记录各 IP 连接数与速率，但不假设多 IP=多 WAN，需对照路由器/网卡实际流量验证。\n\n",
-                            "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
-                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样网卡收发字节、名称、状态、链路速率，对比应用流量与网卡总流量，并显示 TCP 重传率与 RTT/失败率。\n\n",
-                            "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
+                            "纯内存运行：测试配置、统计和日志仅保存在进程内存。\n\n",
+                            "实时速率：按最近约 1 秒应用层字节增量计算。上传实时值是请求体交给 HTTP 客户端的速率，累计有效量只计完整请求返回 HTTP 2xx；下行按实际读取字节计算。\n\n",
+                            "多 WAN：并行查询多个公网 IP 服务，按返回的公网出口 IP 合并显示，列出命中的服务；支持 IPv4/IPv6。探测结果用于识别出口 IP，不代表物理 WAN 口或带宽占比。\n\n",
+                            "仅对自己拥有或已获授权的目标进行连接和带宽测试。"
                         );
                         let wide = to_wide_null(help_text);
                         unsafe {
