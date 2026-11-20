@@ -16,13 +16,14 @@ use crate::state::AppState;
 
 #[cfg(windows)]
 fn show_fatal_error(msg: &str) {
+    use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
     use windows::core::{PCWSTR, w};
 
     let wide: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         MessageBoxW(
-            None,
+            HWND::default(),
             PCWSTR(wide.as_ptr()),
             w!("启动失败 - WinNetStress"),
             MB_OK | MB_ICONERROR,

@@ -5,10 +5,10 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, CreateFontIndirectW, DEFAULT_GUI_FONT, DeleteObject, GetStockObject,
-    GetSysColorBrush, HFONT, HGDIOBJ,
+    GetSysColorBrush, HFONT, HGDIOBJ, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::HiDpi::{
@@ -23,10 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MINMAXINFO, MSG, MessageBoxW,
     NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
     SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW,
-    ShowWindow, SystemParametersInfoW, TranslateMessage, UpdateWindow, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NCDESTROY,
-    WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
-    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
+    WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SIZE,
+    WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -205,9 +205,9 @@ unsafe fn spawn_child(
 ) -> HWND {
     let wtext = to_wide(text);
     let hmenu = if id == 0 {
-        None
+        HMENU::default()
     } else {
-        Some(HMENU(id as usize as *mut c_void))
+        HMENU(id as usize as *mut c_void)
     };
     let hwnd = unsafe {
         CreateWindowExW(
@@ -219,9 +219,9 @@ unsafe fn spawn_child(
             0,
             100,
             24,
-            Some(parent),
+            parent,
             hmenu,
-            None,
+            HINSTANCE::default(),
             None,
         )
     }
@@ -767,7 +767,7 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.tcp_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        Some(hwnd),
+                        hwnd,
                         w!("请先填写至少一个有效的 TCP 测试目标 (ip:port)。"),
                         w!("参数提示"),
                         MB_OK | MB_ICONWARNING,
@@ -783,7 +783,7 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.upload_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        Some(hwnd),
+                        hwnd,
                         w!("请先填写至少一个上传目标 (http(s)://... 或 tcp://ip:port)。"),
                         w!("参数提示"),
                         MB_OK | MB_ICONWARNING,
@@ -799,7 +799,7 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
             if cfg.download_targets.is_empty() {
                 unsafe {
                     MessageBoxW(
-                        Some(hwnd),
+                        hwnd,
                         w!("请先填写至少一个下载目标 URL。"),
                         w!("参数提示"),
                         MB_OK | MB_ICONWARNING,
@@ -846,7 +846,7 @@ fn handle_command(hwnd: HWND, id: u16, data: &mut WindowData) {
                   netsh int ipv4 set dynamicport tcp start=10000 num=55000"
             );
             unsafe {
-                MessageBoxW(Some(hwnd), msg, w!("使用说明与合规声明"), MB_OK | MB_ICONINFORMATION);
+                MessageBoxW(hwnd, msg, w!("使用说明与合规声明"), MB_OK | MB_ICONINFORMATION);
             }
         }
         _ => {}
@@ -879,7 +879,7 @@ unsafe extern "system" fn wndproc(
             layout_controls(hwnd, data);
             refresh_ui(data);
             unsafe {
-                SetTimer(Some(hwnd), TIMER_REFRESH_ID, 250, None);
+                SetTimer(hwnd, TIMER_REFRESH_ID, 250, None);
             }
             LRESULT(0)
         }
@@ -909,7 +909,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_DESTROY => {
             unsafe {
-                let _ = KillTimer(Some(hwnd), TIMER_REFRESH_ID);
+                let _ = KillTimer(hwnd, TIMER_REFRESH_ID);
             }
             data.engine.stop();
             unsafe {
@@ -935,10 +935,10 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
 
     let hmodule = unsafe { GetModuleHandleW(PCWSTR::null()) }
         .map_err(|e| format!("GetModuleHandleW failed: {e}"))?;
-    let hinstance = hmodule.into();
+    let hinstance: HINSTANCE = hmodule.into();
 
     let class_name = w!("WinNetStressMainWnd");
-    let hcursor = unsafe { LoadCursorW(None, IDC_ARROW) }
+    let hcursor = unsafe { LoadCursorW(HINSTANCE::default(), IDC_ARROW) }
         .map_err(|e| format!("LoadCursorW failed: {e}"))?;
     let hbrush = unsafe { GetSysColorBrush(COLOR_BTNFACE) };
 
@@ -980,9 +980,9 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
             CW_USEDEFAULT,
             960,
             740,
-            None,
-            None,
-            Some(hinstance),
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
             Some(raw_ptr.cast::<c_void>()),
         )
     };
@@ -1002,7 +1002,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         let _ = UpdateWindow(hwnd);
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+        while GetMessageW(&mut msg, HWND::default(), 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
