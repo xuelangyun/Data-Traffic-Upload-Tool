@@ -34,7 +34,7 @@ const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_REPLACESEL: u32 = 0x00C2;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const LVM_DELETEITEM_MSG: u32 = 0x1008; // LVM_FIRST + 8
-const LVM_SETCOLUMN_MSG: u32 = 0x101A; // LVM_FIRST + 26
+const LVM_SETCOLUMNW_MSG: u32 = 0x1060; // LVM_FIRST + 96
 const LVM_DELETECOLUMN_MSG: u32 = 0x101C; // LVM_FIRST + 28
 const LVM_SETCOLUMNWIDTH_MSG: u32 = 0x101E; // LVM_FIRST + 30
 
@@ -644,7 +644,7 @@ unsafe fn lv_set_column_title(hwnd: HWND, idx: i32, title: &str) {
     let _ = unsafe {
         SendMessageW(
             hwnd,
-            LVM_SETCOLUMN_MSG,
+            LVM_SETCOLUMNW_MSG,
             WPARAM(idx as usize),
             LPARAM(&mut col as *mut _ as isize),
         )
