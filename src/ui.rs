@@ -584,12 +584,22 @@ fn build_wan_port_rows(
         let Some(address) = configured[index] else {
             return format!("{port:<5} {:<39} {:>4} {:<8} {}", "NOT SET", 0, "CONFIG", "-");
         };
+        let duplicate_ip = configured
+            .iter()
+            .filter(|candidate| **candidate == Some(address))
+            .count() > 1;
         let providers: Vec<&str> = samples
             .iter()
             .filter(|(_, observed)| *observed == address)
             .map(|(provider, _)| provider.as_str())
             .collect();
-        let status = if providers.is_empty() { "NO MATCH" } else { "MATCH" };
+        let status = if duplicate_ip {
+            "DUP IP"
+        } else if providers.is_empty() {
+            "NO MATCH"
+        } else {
+            "MATCH"
+        };
         let provider_text = providers.iter().take(2).copied().collect::<Vec<_>>().join(", ");
         format!(
             "{port:<5} {address:<39} {:>4} {:<8} {}",
@@ -965,7 +975,7 @@ impl UiState {
         defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
         y = det_top + det_h + s(6);
 
-        // Group 4: remote target distribution table (all rows are included in layout height)
+        // Group 4: WAN port mapping table (all four configured ports have fixed-width rows)
         let wan_top = y;
         let wan_title_offset = lh + s(6);
         let target_table_height = wan_title_offset + small_row_h * (2 + MAX_WAN_PORTS as i32) + s(6);
@@ -1285,7 +1295,10 @@ impl UiState {
         );
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
-        let wan_header_text = "PORT   WAN PUBLIC IP                           HITS   STATUS   PROBE PROVIDERS".to_string();
+        let wan_header_text = format!(
+            "{:<5} {:<39} {:>4} {:<8} {}",
+            "PORT", "WAN PUBLIC IP", "HITS", "STATUS", "PROBE PROVIDERS"
+        );
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
         let wan_rows = build_wan_port_rows(&wan_map, &wan_samples);
@@ -1356,6 +1369,15 @@ mod wan_ip_mapping_tests {
         assert_eq!(map[1], Some("198.51.100.2".parse().unwrap()));
         assert_eq!(map[2], Some("2001:db8::3".parse().unwrap()));
         assert_eq!(map[3], None);
+    }
+
+    #[test]
+    fn duplicate_wan_public_ips_are_not_reported_as_unique_matches() {
+        let map = parse_wan_ip_map("WAN1=203.0.113.1; WAN2=203.0.113.1");
+        let samples = parse_egress_ip_observations("api.ipify.org=203.0.113.1");
+        let rows = build_wan_port_rows(&map, &samples);
+        assert!(rows[0].contains("DUP IP"));
+        assert!(rows[1].contains("DUP IP"));
     }
 
     #[test]
@@ -2190,7 +2212,7 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            // WAN egress vertical table (header + ip + 8 rows)
+            // WAN public-IP mapping table (header + four port rows)
             // Create rows BEFORE group so they are above group in Z-order
             let lbl_wan_ip = unsafe {
                 create_ctrl(
@@ -2207,7 +2229,7 @@ unsafe extern "system" fn wnd_proc(
             let lbl_wan_header = unsafe {
                 create_ctrl(
                     w!("STATIC"),
-                    " 序号  目标                 存活/峰值   成功率   RTT   占比",
+                    " PORT   WAN PUBLIC IP                           HITS   STATUS   PROBE PROVIDERS",
                     st_left,
                     0,
                     hwnd,
