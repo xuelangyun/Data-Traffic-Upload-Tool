@@ -372,6 +372,59 @@ fn init_runtime_once<'a>(
             }
         });
 
+        // Background WAN egress public IP detector (async via reqwest, polling every 35s)
+        let wan_stats = state.stats.clone();
+        runtime.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(4))
+                .user_agent("WinNetStress/0.4")
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            let endpoints = [
+                "https://api.ipify.org?format=text",
+                "https://checkip.amazonaws.com",
+                "https://icanhazip.com",
+                "https://ifconfig.me/ip",
+            ];
+            loop {
+                let mut detected: Option<String> = None;
+                for url in endpoints {
+                    if let Ok(Ok(resp)) = tokio::time::timeout(
+                        Duration::from_secs(4),
+                        client.get(url).send(),
+                    )
+                    .await
+                    {
+                        if let Ok(txt) = resp.text().await {
+                            let ip = txt.trim().to_string();
+                            if !ip.is_empty() && ip.len() < 64 && ip.chars().all(|c| c.is_ascii_alphanumeric() || c=='.' || c==':' || c=='/') {
+                                // basic ipv4/ipv6 sanity: contains dot or colon
+                                if ip.contains('.') || ip.contains(':') {
+                                    detected = Some(ip);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ip) = detected {
+                    let mut guard = wan_stats.wan_public_ip.lock();
+                    if *guard != ip {
+                        *guard = ip.clone();
+                    }
+                    wan_stats.wan_last_update_ms.store(
+                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(35)).await;
+            }
+        });
+
         Ok(runtime)
     });
 

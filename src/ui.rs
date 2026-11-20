@@ -53,6 +53,9 @@ struct LabelCache {
     duplex_row: String,
     nic_row: String,
     rank_row: String,
+    wan_ip: String,
+    wan_header: String,
+    wan_rows: [String; 8],
 }
 
 struct SystemColors {
@@ -510,8 +513,15 @@ struct UiState {
     lbl_nic_row: HWND,
     lbl_rank_row: HWND,
 
-    // Chart
-    grp_chart: HWND,
+    // WAN egress vertical table
+    grp_wan: HWND,
+    lbl_wan_ip: HWND,
+    lbl_wan_header: HWND,
+    wan_rows: [HWND; 8],
+
+    // Chart (no child window clip - painted directly on parent)
+    lbl_chart_title: HWND,
+    // grp_chart removed
 
     // Log group
     grp_log: HWND,
@@ -640,7 +650,13 @@ impl UiState {
             set_font(self.lbl_nic_row, t.font_small);
             set_font(self.lbl_rank_row, t.font_small);
 
-            set_font(self.grp_chart, t.font_bold);
+            set_font(self.grp_wan, t.font_bold);
+            set_font(self.lbl_wan_ip, t.font_small);
+            set_font(self.lbl_wan_header, t.font_small);
+            for &hw in &self.wan_rows {
+                set_font(hw, t.font_small);
+            }
+            set_font(self.lbl_chart_title, t.font_bold);
             set_font(self.grp_log, t.font_bold);
             set_font(self.edit_log, t.font_log);
         }
@@ -652,19 +668,20 @@ impl UiState {
         let lh = self.theme.line_h;
         let th = self.theme.title_h;
 
-        let margin = s(14);
-        let inner_pad = s(12);
-        let gap = s(8);
-        let row_gap = s(6);
-        let w = (width - margin * 2).max(s(760));
+        // Compact margins
+        let margin = s(8);
+        let inner_pad = s(8);
+        let gap = s(6);
+        let row_gap = s(4);
+        let w = (width - margin * 2).max(s(860));
 
-        let row_h = lh + s(10);
-        let small_row_h = lh + s(6);
-        let edit_h = lh + s(8);
-        let multi_edit_h = lh * 3 + s(16);
-        let btn_h = lh + s(16);
+        let row_h = lh + s(4);
+        let small_row_h = lh + s(2);
+        let edit_h = lh + s(4);
+        let multi_edit_h = lh * 2 + s(8);
+        let btn_h = lh + s(8);
 
-        let mut hdwp = unsafe { BeginDeferWindowPos(50) };
+        let mut hdwp = unsafe { BeginDeferWindowPos(64) };
         let defer = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
             if !hdwp.0.is_null() {
                 *hdwp = unsafe {
@@ -712,61 +729,61 @@ impl UiState {
             }
         };
 
-        let mut y = s(10);
+        let mut y = s(6);
 
-        // Top header bar
-        let title_w = (w * 52) / 100;
+        // Top header bar - compact
+        let title_w = (w * 50) / 100;
         let status_w = w - title_w - gap;
-        let title_row_h = th + s(6);
+        let title_row_h = th + s(4);
         defer(&mut hdwp, self.lbl_title, margin, y, title_w, title_row_h);
         defer(
             &mut hdwp,
             self.lbl_status,
             margin + title_w + gap,
-            y + s(2),
+            y + s(1),
             status_w,
-            title_row_h - s(2),
+            title_row_h - s(1),
         );
-        y += title_row_h + s(2);
+        y += title_row_h + s(1);
 
-        defer(&mut hdwp, self.lbl_mem_badge, margin, y, w, lh + s(4));
-        y += lh + s(10);
+        defer(&mut hdwp, self.lbl_mem_badge, margin, y, w, lh + s(2));
+        y += lh + s(6);
 
         // Group 1: Config
         let cfg_top = y;
-        let cfg_title_offset = lh + s(10);
+        let cfg_title_offset = lh + s(6);
         let cfg_inner_w = w - inner_pad * 2;
         let cfg_x = margin + inner_pad;
         let mut cy = cfg_top + cfg_title_offset;
 
-        let lbl_s_w = s(136);
-        let edt_s_w = s(56);
-        let lbl_m_w = s(158);
-        let edt_m_w = s(74);
-        let lbl_h_w = s(104);
-        let edt_h_w = s(48);
+        let lbl_s_w = s(124);
+        let edt_s_w = s(52);
+        let lbl_m_w = s(142);
+        let edt_m_w = s(64);
+        let lbl_h_w = s(92);
+        let edt_h_w = s(42);
 
         let mut rx = cfg_x;
         defer(&mut hdwp, self.lbl_streams, rx, cy, lbl_s_w, edit_h);
-        rx += lbl_s_w + s(4);
+        rx += lbl_s_w + s(3);
         defer(&mut hdwp, self.edit_streams, rx, cy, edt_s_w, edit_h);
-        rx += edt_s_w + s(12);
+        rx += edt_s_w + s(8);
 
         defer(&mut hdwp, self.lbl_max_conns, rx, cy, lbl_m_w, edit_h);
-        rx += lbl_m_w + s(4);
+        rx += lbl_m_w + s(3);
         defer(&mut hdwp, self.edit_max_conns, rx, cy, edt_m_w, edit_h);
-        rx += edt_m_w + s(12);
+        rx += edt_m_w + s(8);
 
         defer(&mut hdwp, self.lbl_hold_secs, rx, cy, lbl_h_w, edit_h);
-        rx += lbl_h_w + s(4);
+        rx += lbl_h_w + s(3);
         defer(&mut hdwp, self.edit_hold_secs, rx, cy, edt_h_w, edit_h);
-        rx += edt_h_w + s(12);
+        rx += edt_h_w + s(8);
 
-        let chk_w = (cfg_x + cfg_inner_w - rx).max(s(146));
+        let chk_w = (cfg_x + cfg_inner_w - rx).max(s(132));
         defer(&mut hdwp, self.chk_continuous, rx, cy, chk_w, edit_h);
         cy += edit_h + row_gap;
 
-        let target_lbl_w = s(188);
+        let target_lbl_w = s(176);
         let target_edt_w = (cfg_inner_w - target_lbl_w - gap).max(s(220));
         let target_edt_x = cfg_x + target_lbl_w + gap;
 
@@ -808,14 +825,14 @@ impl UiState {
             target_edt_w,
             multi_edit_h,
         );
-        cy += multi_edit_h + s(12);
+        cy += multi_edit_h + s(8);
 
         let cfg_h = cy - cfg_top;
         defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
-        y = cfg_top + cfg_h + s(10);
+        y = cfg_top + cfg_h + s(6);
 
         // Action buttons row (8 buttons)
-        let b_gap = s(6);
+        let b_gap = s(4);
         let avail = w - b_gap * 7;
         let weights = [118, 118, 118, 128, 112, 82, 82, 82];
         let total_w: i32 = weights.iter().sum();
@@ -839,11 +856,11 @@ impl UiState {
             defer(&mut hdwp, btn, bx, y, bw, btn_h);
             bx += bw + b_gap;
         }
-        y += btn_h + s(10);
+        y += btn_h + s(6);
 
         // Group 2: Metrics (5 rows: conn1,2,3, up, down)
         let met_top = y;
-        let met_h = cfg_title_offset + row_h + small_row_h * 2 + row_h * 2 + s(10);
+        let met_h = cfg_title_offset + row_h + small_row_h * 2 + row_h * 2 + s(6);
         defer_bottom(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
 
         let mut my = met_top + cfg_title_offset;
@@ -856,12 +873,11 @@ impl UiState {
         defer(&mut hdwp, self.lbl_up_row, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
         defer(&mut hdwp, self.lbl_down_row, cfg_x, my, cfg_inner_w, row_h);
-        y = met_top + met_h + s(10);
+        y = met_top + met_h + s(6);
 
-        // Group 3: Bandwidth detail (up_detail, down_detail, duplex, nic, rank)
+        // Group 3: Bandwidth detail (5 rows)
         let det_top = y;
-        let det_h = cfg_title_offset + row_h + small_row_h * 4 + s(10);
-        // Actually we have: up_detail (small), down_detail (small), duplex (bold), nic (small), rank (small) => 5 rows
+        let det_h = cfg_title_offset + row_h + small_row_h * 4 + s(6);
         defer_bottom(&mut hdwp, self.grp_bandwidth, margin, det_top, w, det_h);
         let mut dy = det_top + cfg_title_offset;
         defer(&mut hdwp, self.lbl_up_detail, cfg_x, dy, cfg_inner_w, small_row_h);
@@ -873,24 +889,44 @@ impl UiState {
         defer(&mut hdwp, self.lbl_nic_row, cfg_x, dy, cfg_inner_w, small_row_h);
         dy += small_row_h;
         defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
-        y = det_top + det_h + s(10);
+        y = det_top + det_h + s(6);
 
-        // Group 4: Chart
-        let chart_top = y;
-        let chart_h = s(160).max(lh * 8 + s(20));
-        defer_bottom(&mut hdwp, self.grp_chart, margin, chart_top, w, chart_h);
-        // Inner chart rect for GDI drawing
+        // Group 4: WAN egress vertical table (dynamic rows, max 8)
+        let wan_top = y;
+        let wan_title_offset = lh + s(6);
+        // header + ip line + up to 6 visible rows compact
+        let visible_wan = 6;
+        let wan_h = wan_title_offset + small_row_h * 2 + row_h.min(s(16))*0 + small_row_h * visible_wan + s(6);
+        // Actually compute: 2 small rows (ip + header) + visible rows
+        let wan_h2 = wan_title_offset + small_row_h + small_row_h + (small_row_h * visible_wan) + s(6);
+        defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h2);
+        let mut wy = wan_top + wan_title_offset;
+        defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wy, cfg_inner_w, small_row_h);
+        wy += small_row_h;
+        defer(&mut hdwp, self.lbl_wan_header, cfg_x, wy, cfg_inner_w, small_row_h);
+        wy += small_row_h;
+        for i in 0..8 {
+            defer(&mut hdwp, self.wan_rows[i], cfg_x, wy, cfg_inner_w, small_row_h);
+            wy += small_row_h;
+        }
+        y = wan_top + wan_h2 + s(6);
+
+        // Chart title label + rect (painted directly on parent, no child window)
+        let chart_title_h = lh + s(4);
+        defer(&mut hdwp, self.lbl_chart_title, margin, y, w, chart_title_h);
+        y += chart_title_h + s(4);
+        let chart_h = s(130).max(lh * 7 + s(12));
         self.chart_rect = RECT {
-            left: cfg_x,
-            top: chart_top + cfg_title_offset,
-            right: cfg_x + cfg_inner_w,
-            bottom: chart_top + chart_h - s(8),
+            left: margin + s(2),
+            top: y,
+            right: margin + w - s(2),
+            bottom: y + chart_h,
         };
-        y = chart_top + chart_h + s(10);
+        y = y + chart_h + s(6);
 
-        // Group 5: Log
+        // Group 5: Log - fill remaining
         let log_top = y;
-        let log_h = (height - log_top - s(12)).max(s(120));
+        let log_h = (height - log_top - s(6)).max(s(90));
         defer_bottom(&mut hdwp, self.grp_log, margin, log_top, w, log_h);
         defer(
             &mut hdwp,
@@ -898,7 +934,7 @@ impl UiState {
             cfg_x,
             log_top + cfg_title_offset,
             cfg_inner_w,
-            (log_h - cfg_title_offset - s(10)).max(s(80)),
+            (log_h - cfg_title_offset - s(6)).max(s(60)),
         );
 
         if !hdwp.0.is_null() {
@@ -1147,6 +1183,53 @@ impl UiState {
         let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
         let rank_text = format!("[节点排名] 上行: {up_rank}  |  下行: {down_rank}");
         unsafe { set_cached_text(self.lbl_rank_row, &mut self.cache.rank_row, rank_text) };
+
+        // WAN egress auto-detected public IP + vertical distribution
+        let wan_ip_raw = stats.wan_public_ip.lock().clone();
+        let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw == "检测中..." {
+            "检测中...".to_string()
+        } else {
+            wan_ip_raw.clone()
+        };
+        let wan_age = {
+            let last = stats.wan_last_update_ms.load(Ordering::Relaxed);
+            if last==0 { "".to_string() } else {
+                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let secs = now_ms.saturating_sub(last)/1000;
+                if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
+            }
+        };
+        let wan_ip_text = format!("出口公网IP: {} (自动探测·每35s刷新{}) | 本机分流见下表(动态调整)", wan_ip_disp, wan_age);
+        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_ip_text) };
+
+        let wan_header_text = "  序号  目标(出口标识)                 存活/峰值   成功率   RTT   占比".to_string();
+        unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
+
+        let wan_rows = stats.wan_vertical_rows();
+        for idx in 0..8 {
+            let next = if idx < wan_rows.len() {
+                let r = &wan_rows[idx];
+                // Format aligned columns: use fixed-width like formatting
+                // e.g., " ① 223.5.5.5:443 (223.5.5.5)    12/45  98.1%  14ms  31.2%"
+                let label_disp = if r.label.len() > 22 { format!("{}…", &r.label[..21]) } else { r.label.clone() };
+                format!("  {:>2}. {:<24} {:>3}/{:<3}  {:>5.1}%  {:>3}ms  {:>4.1}%",
+                    idx+1, label_disp, r.active, r.peak, r.pct, r.rtt, r.share)
+            } else {
+                if stats.mode()==crate::state::AppMode::Idle && idx==0 {
+                    "  (空闲 — 开始并发测试后自动显示各出口分布)".to_string()
+                } else if wan_rows.is_empty() && idx==0 {
+                    "  等待健康检查...".to_string()
+                } else {
+                    "".to_string()
+                }
+            };
+            // Show/hide row window based on emptiness?
+            let hwnd = self.wan_rows[idx];
+            // We still update text even if empty to clear
+            unsafe { set_cached_text(hwnd, &mut self.cache.wan_rows[idx], next) };
+            let show = !self.cache.wan_rows[idx].is_empty();
+            let _ = unsafe { ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE }) };
+        }
 
         // Delta-append memory ring buffer log
         let (new_gen, new_seq, lines, reset) = self.app.log.fetch_since(self.log_gen, self.log_seq);
@@ -1436,8 +1519,8 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
             96
         };
 
-        let init_w = scale_px(1080, sys_dpi).min((screen_w * 92) / 100);
-        let init_h = scale_px(960, sys_dpi).min((screen_h * 92) / 100);
+        let init_w = scale_px(980, sys_dpi).min((screen_w * 92) / 100);
+        let init_h = scale_px(900, sys_dpi).min((screen_h * 92) / 100);
 
         let init_ctx = Box::new((state, engine));
         let raw_ctx = Box::into_raw(init_ctx);
@@ -1446,7 +1529,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
             0,
             class_name,
             w!("WinNetStress - 纯内存网络并发与带宽压力测试工具"),
-            (WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN) as u32,
+            (WS_OVERLAPPEDWINDOW) as u32,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             init_w,
@@ -1989,12 +2072,66 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            // Chart group (no inner text controls, painted via GDI)
-            let grp_chart = unsafe {
+            // WAN egress vertical table (header + ip + 8 rows)
+            // Create rows BEFORE group so they are above group in Z-order
+            let lbl_wan_ip = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "出口公网IP: 检测中...",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
+            let lbl_wan_header = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    " 序号  目标                 存活/峰值   成功率   RTT   占比",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
+            let mut wan_rows: [HWND; 8] = [HWND(std::ptr::null_mut()); 8];
+            for i in 0..8 {
+                wan_rows[i] = unsafe {
+                    create_ctrl(
+                        w!("STATIC"),
+                        "",
+                        st_left,
+                        0,
+                        hwnd,
+                        0,
+                        hinst,
+                        theme.font_small,
+                    )
+                };
+            }
+            let grp_wan = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
-                    " 实时速度曲线 (上行·下行·双向合计 vs 网卡实际流量) ",
+                    " 多 WAN 出口分布 (自动推测公网IP·竖排动态显示) ",
                     grp_style,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
+
+            // Chart title (static bold) - chart body painted on parent DC
+            let lbl_chart_title = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "实时速度曲线 (上行·下行·双向合计 vs 网卡实际流量)  —— 60秒历史 · 格栅坐标",
+                    st_left,
                     0,
                     hwnd,
                     0,
@@ -2076,7 +2213,11 @@ unsafe extern "system" fn wnd_proc(
                 lbl_duplex_row,
                 lbl_nic_row,
                 lbl_rank_row,
-                grp_chart,
+                grp_wan,
+                lbl_wan_ip,
+                lbl_wan_header,
+                wan_rows,
+                lbl_chart_title,
                 grp_log,
                 edit_log,
             });
@@ -2191,8 +2332,7 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             let _ = unsafe { EndPaint(hwnd, &ps) };
-            // Let child controls paint via DefWindowProc after we validated
-            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+            return LRESULT(0);
         }
         m if m == WM_DPICHANGED as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
