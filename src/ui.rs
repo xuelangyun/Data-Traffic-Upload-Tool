@@ -570,7 +570,7 @@ unsafe fn create_listview(parent: HWND, hinst: HINSTANCE, font: HFONT) -> HWND {
     if !hwnd.0.is_null() {
         unsafe { set_font(hwnd, font) };
         // Extended styles: gridlines + fullrowselect + doublebuffer (0x00010000)
-        let ex = (LVS_EX_GRIDLINES as u32 | LVS_EX_FULLROWSELECT as u32 | LVS_EX_DOUBLEBUFFER as u32 | LVS_EX_HEADERDRAGDROP as u32) as usize;
+        let ex = (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP) as usize;
         let _ = unsafe { SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE as u32, WPARAM(0), LPARAM(ex as isize)) };
     }
     hwnd

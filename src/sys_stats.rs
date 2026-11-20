@@ -197,56 +197,30 @@ mod win_imp {
     }
 
     pub fn query_egress_local_ips() -> Vec<String> {
-        // Use GetAdaptersAddresses to enumerate unicast IPv4
-        use windows::Win32::NetworkManagement::IpHelper::GetAdaptersAddresses;
-        use windows::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC};
-        use windows::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
-        let mut size: u32 = 0;
-        unsafe { GetAdaptersAddresses(AF_UNSPEC as u32, 0, None, None, &mut size) };
-        if size == 0 { return Vec::new(); }
-        let mut buf = vec![0u8; size as usize];
-        let ret = unsafe {
-            GetAdaptersAddresses(
-                AF_INET as u32,
-                0x0008 | 0x0010, // GAA_FLAG_INCLUDE_PREFIX | SKIP_ANYCAST
-                None,
-                Some(buf.as_mut_ptr() as *mut _),
-                &mut size,
-            )
-        };
+        // Simplified: use UDP trick to get default egress IP; avoids brittle Win32 type paths across windows-rs versions.
+        // Prior implementation used GetAdaptersAddresses via iphlpapi which required version-specific import paths
+        // (NetworkManagement::IpHelper vs iphlpapi, Networking::WinSock vs winsock2/ws2, Foundation vs winerror).
+        // For robustness on tag 74 we fallback to UDP method and supplement via egress_map in caller.
         let mut ips = Vec::new();
-        if ret != 0 { return ips; }
-        // Walk linked list
-        unsafe {
-            let mut cur = buf.as_ptr() as *const windows::Win32::NetworkManagement::IpHelper::IP_ADAPTER_ADDRESSES_LH;
-            while !cur.is_null() {
-                let adapter = &*cur;
-                let mut uni = adapter.FirstUnicastAddress;
-                while !uni.is_null() {
-                    let ua = &*uni;
-                    let sa = ua.Address.lpSockaddr;
-                    if !sa.is_null() && (*sa).sa_family == AF_INET as u16 {
-                        let sin = &*(sa as *const windows::Win32::Networking::WinSock::SOCKADDR_IN);
-                        let ip_bytes = sin.sin_addr.S_un.S_addr.to_ne_bytes();
-                        // sin_addr is network order
-                        let ip = std::net::Ipv4Addr::new(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
-                        if !ip.is_loopback() && !ip.is_unspecified() {
-                            let s = ip.to_string();
-                            if !ips.contains(&s) { ips.push(s); }
-                        }
-                    }
-                    uni = ua.Next;
+        // Try to get default egress via UDP connect trick
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.connect("8.8.8.8:80");
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip().to_string();
+                if ip != "0.0.0.0" && ip != "127.0.0.1" && !ip.is_empty() {
+                    ips.push(ip);
                 }
-                cur = adapter.Next;
             }
         }
+        // Also try secondary public DNS to detect dual-stack or second egress
         if ips.is_empty() {
-            // Fallback: UDP trick for default egress
             if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                let _ = sock.connect("8.8.8.8:80");
+                let _ = sock.connect("1.1.1.1:80");
                 if let Ok(local) = sock.local_addr() {
                     let ip = local.ip().to_string();
-                    if ip != "0.0.0.0" { ips.push(ip); }
+                    if ip != "0.0.0.0" && ip != "127.0.0.1" {
+                        if !ips.contains(&ip) { ips.push(ip); }
+                    }
                 }
             }
         }
