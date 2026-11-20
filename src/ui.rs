@@ -547,6 +547,59 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn parse_wan_ip_map(raw: &str) -> [Option<IpAddr>; MAX_WAN_PORTS] {
+    let mut result: [Option<IpAddr>; MAX_WAN_PORTS] = std::array::from_fn(|_| None);
+    for item in raw.split([';', ',', '\\n', '\\r']) {
+        let Some((name, address)) = item.trim().split_once('=') else {
+            continue;
+        };
+        let Some(index) = name.trim().to_ascii_uppercase().strip_prefix("WAN")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1))
+        else {
+            continue;
+        };
+        if index < MAX_WAN_PORTS {
+            result[index] = address.trim().parse::<IpAddr>().ok();
+        }
+    }
+    result
+}
+
+fn parse_egress_ip_observations(raw: &str) -> Vec<(String, IpAddr)> {
+    raw.split('|')
+        .filter_map(|item| {
+            let (provider, address) = item.trim().split_once('=')?;
+            Some((provider.trim().to_string(), address.trim().parse::<IpAddr>().ok()?))
+        })
+        .collect()
+}
+
+fn build_wan_port_rows(
+    configured: &[Option<IpAddr>; MAX_WAN_PORTS],
+    samples: &[(String, IpAddr)],
+) -> [String; MAX_WAN_PORTS] {
+    std::array::from_fn(|index| {
+        let port = format!("WAN{}", index + 1);
+        let Some(address) = configured[index] else {
+            return format!("{port:<5} {:<39} {:>4} {:<8} {}", "NOT SET", 0, "CONFIG", "-");
+        };
+        let providers: Vec<&str> = samples
+            .iter()
+            .filter(|(_, observed)| *observed == address)
+            .map(|(provider, _)| provider.as_str())
+            .collect();
+        let status = if providers.is_empty() { "NO MATCH" } else { "MATCH" };
+        let provider_text = providers.iter().take(2).copied().collect::<Vec<_>>().join(", ");
+        format!(
+            "{port:<5} {address:<39} {:>4} {:<8} {}",
+            providers.len(),
+            status,
+            if provider_text.is_empty() { "-" } else { &provider_text }
+        )
+    })
+}
+
 unsafe fn set_text(hwnd: HWND, text: &str) {
     let wide = to_wide_null(text);
     let _ = unsafe { SetWindowTextW(hwnd, PCWSTR(wide.as_ptr())) };
@@ -1213,14 +1266,29 @@ impl UiState {
                 if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
             }
         };
-        let egress_ip_text = format!("公网出口 IP 抽样（按独立探测目标；不等同 WAN 线路）: {}{}", egress_ip_disp, egress_ip_age);
+        let wan_map = parse_wan_ip_map(&unsafe { get_text(self.edit_wan_map) });
+        let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
+        let configured_ips: Vec<IpAddr> = wan_map.iter().filter_map(|ip| *ip).collect();
+        let unmatched_ips: Vec<String> = wan_samples
+            .iter()
+            .filter(|(_, ip)| !configured_ips.contains(ip))
+            .map(|(provider, ip)| format!("{provider}={ip}"))
+            .collect();
+        let unmatched_summary = if unmatched_ips.is_empty() {
+            "无未匹配出口".to_string()
+        } else {
+            unmatched_ips.join(", ")
+        };
+        let egress_ip_text = format!(
+            "公网出口探测更新时间{} | 未匹配WAN映射: {}",
+            egress_ip_age,
+            unmatched_summary
+        );
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
         let wan_header_text = "PORT   WAN PUBLIC IP                           HITS   STATUS   PROBE PROVIDERS".to_string();
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
-        let wan_map = parse_wan_ip_map(&unsafe { get_text(self.edit_wan_map) });
-        let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
         let wan_rows = build_wan_port_rows(&wan_map, &wan_samples);
         for idx in 0..MAX_WAN_PORTS {
             let next = wan_rows[idx].clone();
