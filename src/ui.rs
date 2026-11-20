@@ -549,7 +549,7 @@ fn to_wide_null(s: &str) -> Vec<u16> {
 
 fn parse_wan_ip_map(raw: &str) -> [Option<IpAddr>; MAX_WAN_PORTS] {
     let mut result: [Option<IpAddr>; MAX_WAN_PORTS] = std::array::from_fn(|_| None);
-    for item in raw.split([';', ',', '\\n', '\\r']) {
+    for item in raw.split(|ch| ch == ';' || ch == ',' || ch == '\n' || ch == '\r') {
         let Some((name, address)) = item.trim().split_once('=') else {
             continue;
         };
@@ -1257,7 +1257,6 @@ impl UiState {
 
         // Independent public-IP observations by destination; not a WAN1/WAN2 mapping.
         let egress_ip_raw = stats.egress_ip_observations.lock().clone();
-        let egress_ip_disp = if egress_ip_raw.is_empty() { "等待探测".to_string() } else { egress_ip_raw.clone() };
         let egress_ip_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last==0 { "".to_string() } else {
@@ -1341,6 +1340,34 @@ impl UiState {
         }
         self.log_gen = new_gen;
         self.log_seq = new_seq;
+    }
+}
+
+#[cfg(test)]
+mod wan_ip_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn parses_four_wan_public_ip_mappings() {
+        let map = parse_wan_ip_map(
+            "WAN1=203.0.113.1; WAN2=198.51.100.2; WAN3=2001:db8::3; WAN4=",
+        );
+        assert_eq!(map[0], Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(map[1], Some("198.51.100.2".parse().unwrap()));
+        assert_eq!(map[2], Some("2001:db8::3".parse().unwrap()));
+        assert_eq!(map[3], None);
+    }
+
+    #[test]
+    fn maps_observed_exit_ip_only_to_an_exact_wan_ip() {
+        let map = parse_wan_ip_map("WAN1=203.0.113.1; WAN2=198.51.100.2");
+        let samples = parse_egress_ip_observations(
+            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=198.51.100.9",
+        );
+        let rows = build_wan_port_rows(&map, &samples);
+        assert!(rows[0].contains("MATCH"));
+        assert!(rows[0].contains("api.ipify.org"));
+        assert!(rows[1].contains("NO MATCH"));
     }
 }
 
@@ -2528,7 +2555,7 @@ unsafe extern "system" fn wnd_proc(
                             "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
                             "  · 失败请求独立统计，不计入成功率分母。\n\n",
                             "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
-                            "4. 出口识别：表格展示的是远端目标连接分布，不是 WAN1/WAN2 实际端口分布；公网 IP 抽样按不同探测目标独立采集，也不能单独证明 WAN 线路映射。要确认物理 WAN 流量，需要读取路由器接口计数器或 SNMP。\n\n",
+                            "4. WAN IP 对应：在配置栏填写 WAN1=公网IP; WAN2=公网IP; WAN3=公网IP; WAN4=公网IP。程序将多个独立公网探测点返回的出口 IP 与配置值精确匹配，显示命中次数和探测来源；未匹配的出口 IP 单独列出。必须填写每条 WAN 的公网出口 IP；若路由器 WAN 接口拿到私网/CGNAT 地址，公网探测 IP 不会相等，需要读取路由器 WAN 状态才能准确关联。\n\n",
                             "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
                             "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 汇总物理网卡流量并排除虚拟接口；系统 IPv4 TCP 重传率按采样增量计算。\n\n",
                             "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
