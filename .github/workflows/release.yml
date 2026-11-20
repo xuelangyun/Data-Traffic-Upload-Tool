@@ -91,10 +91,14 @@ jobs:
           $bundleDir = "$distDir/bundle"
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 
+          Write-Host "Listing target dirs for debug:"
+          Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" | ForEach-Object { Write-Host $_.FullName }
           $srcExe = "target/x86_64-pc-windows-msvc/release/win_net_stress.exe"
           if (-not (Test-Path $srcExe)) {
+            Write-Host "Not found at $srcExe, trying fallback"
             $srcExe = "target/release/win_net_stress.exe"
           }
+          Write-Host "Using srcExe=$srcExe"
           if (-not (Test-Path $srcExe)) {
             throw "Compiled binary not found: $srcExe"
           }
