@@ -92,15 +92,25 @@ jobs:
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 
           Write-Host "Listing target dirs for debug:"
-          Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" | ForEach-Object { Write-Host $_.FullName }
+          Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
           $srcExe = "target/x86_64-pc-windows-msvc/release/win_net_stress.exe"
           if (-not (Test-Path $srcExe)) {
             Write-Host "Not found at $srcExe, trying fallback"
             $srcExe = "target/release/win_net_stress.exe"
           }
-          Write-Host "Using srcExe=$srcExe"
+          Write-Host "Using srcExe=$srcExe TestPath=$((Test-Path $srcExe))"
           if (-not (Test-Path $srcExe)) {
-            throw "Compiled binary not found: $srcExe"
+            Write-Host "Searching for any win_net_stress.exe under target:"
+            $found = Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) {
+              $srcExe = $found.FullName
+              Write-Host "Found via search: $srcExe"
+            } else {
+              Write-Host "Dir listing target:"
+              Get-ChildItem -Path "target" -Directory | ForEach-Object { Write-Host $_.Name }
+              if (Test-Path "target/x86_64-pc-windows-msvc") { Get-ChildItem -Path "target/x86_64-pc-windows-msvc" -Directory | ForEach-Object { Write-Host "x86_64 subdir $($_.Name)" } }
+              throw "Compiled binary not found: $srcExe"
+            }
           }
 
           $outExe = "$distDir/${env:ASSET_PREFIX}.exe"
