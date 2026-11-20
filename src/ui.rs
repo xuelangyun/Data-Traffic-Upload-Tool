@@ -1323,9 +1323,9 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         }).collect();
 
         // Up: orange solid 2px
-        plot_series(mem_dc, up_pts, rgb(234, 88, 12), 2, PS_SOLID as u32);
+        plot_series(mem_dc, up_pts, rgb(234, 88, 12), 2, PS_SOLID);
         // Down: blue solid 2px
-        plot_series(mem_dc, down_pts, rgb(37, 99, 235), 2, PS_SOLID as u32);
+        plot_series(mem_dc, down_pts, rgb(37, 99, 235), 2, PS_SOLID);
         // Duplex combined: green if active (sum)
         if stats.mode() == AppMode::DuplexTesting {
             let duplex_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
@@ -1333,12 +1333,12 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
                 let yf = ((pt.up_bps + pt.down_bps) as f64 / max_f).clamp(0.0, 1.0);
                 (xf, yf)
             }).collect();
-            plot_series(mem_dc, duplex_pts, rgb(5, 122, 85), 2, PS_SOLID as u32);
+            plot_series(mem_dc, duplex_pts, rgb(5, 122, 85), 2, PS_SOLID);
         }
         // NIC up: orange dashed
-        plot_series(mem_dc, nic_up_pts, rgb(180, 120, 40), 1, PS_DOT as u32);
+        plot_series(mem_dc, nic_up_pts, rgb(180, 120, 40), 1, PS_DOT);
         // NIC down: blue dashed
-        plot_series(mem_dc, nic_down_pts, rgb(100, 130, 180), 1, PS_DOT as u32);
+        plot_series(mem_dc, nic_down_pts, rgb(100, 130, 180), 1, PS_DOT);
     }
 
     // Legend at top-right inside chart

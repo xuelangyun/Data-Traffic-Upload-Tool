@@ -19,7 +19,6 @@ mod win_imp {
     use std::sync::Mutex;
     use std::time::Instant;
     // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
-    use windows::Win32::Foundation::NTSTATUS;
     use windows::Win32::iphlpapi::GetTcpStatistics;
     use windows::Win32::netioapi::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
     use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
