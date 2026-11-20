@@ -219,13 +219,15 @@ impl EngineHandle {
                 if secs <= 0.0 {
                     continue;
                 }
-                let total = stats.conn_established_total.load(Ordering::Relaxed);
+                let total = stats.conn_orig_success.load(Ordering::Relaxed)
+                    + stats.conn_replenish_success.load(Ordering::Relaxed);
                 let delta = total.saturating_sub(last_estab);
                 last_estab = total;
                 last_time = now;
 
                 let cps = ((delta as f64) / secs).round().max(0.0) as u64;
                 stats.conn_per_sec.store(cps, Ordering::Relaxed);
+                stats.update_cps_peak(cps);
             }
         });
     }

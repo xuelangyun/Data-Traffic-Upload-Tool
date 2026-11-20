@@ -43,6 +43,7 @@ struct LabelCache {
     mem_badge: String,
     conn_row1: String,
     conn_row2: String,
+    conn_row3: String,
     up_row: String,
     down_row: String,
 }
@@ -484,6 +485,7 @@ struct UiState {
     grp_metrics: HWND,
     lbl_conn_row1: HWND,
     lbl_conn_row2: HWND,
+    lbl_conn_row3: HWND,
     lbl_up_row: HWND,
     lbl_down_row: HWND,
 
@@ -603,6 +605,7 @@ impl UiState {
             set_font(self.grp_metrics, t.font_bold);
             set_font(self.lbl_conn_row1, t.font_bold);
             set_font(self.lbl_conn_row2, t.font_ui);
+            set_font(self.lbl_conn_row3, t.font_ui);
             set_font(self.lbl_up_row, t.font_ui);
             set_font(self.lbl_down_row, t.font_ui);
 
@@ -806,15 +809,17 @@ impl UiState {
         }
         y += btn_h + s(10);
 
-        // Group 2: Metrics (4 full-width clear rows)
+        // Group 2: Metrics (5 full-width clear rows)
         let met_top = y;
-        let met_h = cfg_title_offset + row_h * 4 + s(10);
+        let met_h = cfg_title_offset + row_h * 5 + s(10);
         defer_bottom(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
 
         let mut my = met_top + cfg_title_offset;
         defer(&mut hdwp, self.lbl_conn_row1, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
         defer(&mut hdwp, self.lbl_conn_row2, cfg_x, my, cfg_inner_w, row_h);
+        my += row_h;
+        defer(&mut hdwp, self.lbl_conn_row3, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
         defer(&mut hdwp, self.lbl_up_row, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
@@ -932,23 +937,38 @@ impl UiState {
         let c_tgt = stats.conn_target_probe.load(Ordering::Relaxed);
         let c_peak = stats.conn_peak.load(Ordering::Relaxed);
         let c_stable = stats.conn_stable_max.load(Ordering::Relaxed);
+        let c_hold = stats.conn_long_hold_max.load(Ordering::Relaxed);
+        let hold_secs = stats.conn_hold_elapsed_secs.load(Ordering::Relaxed);
         let c_cps = stats.conn_per_sec.load(Ordering::Relaxed);
+        let cps_peak = stats.conn_cps_peak.load(Ordering::Relaxed);
         let c_rtt = stats.conn_rtt_ms.load(Ordering::Relaxed);
+        let orig_ok = stats.conn_orig_success.load(Ordering::Relaxed);
+        let orig_att = stats.conn_orig_attempts.load(Ordering::Relaxed);
+        let orig_pct = stats.orig_success_rate_pct();
+
         let conn_row1 = format!(
-            "[连接探测] 存活会话: {c_cur}  |  目标阶梯: {c_tgt}  |  峰值并发: {c_peak}  |  稳定上限: {c_stable}  |  建连速率: {c_cps}/s  |  握手延迟: {c_rtt} ms"
+            "[分级结果] 瞬时峰值: {c_peak} (建连峰值 {cps_peak}/s, 原始成功率 {orig_pct:.1}%)  |  稳定并发: {c_stable}  |  长时间保持: {c_hold} (持续 {hold_secs}s)"
         );
         unsafe { set_cached_text(self.lbl_conn_row1, &mut self.cache.conn_row1, conn_row1) };
 
-        let c_att = stats.conn_attempts.load(Ordering::Relaxed);
-        let c_rec = stats.conn_remote_closed.load(Ordering::Relaxed);
-        let f_to = stats.conn_fail_timeout.load(Ordering::Relaxed);
+        let rep_ok = stats.conn_replenish_success.load(Ordering::Relaxed);
+        let rep_att = stats.conn_replenish_attempts.load(Ordering::Relaxed);
+        let f_loc = stats.conn_fail_local.load(Ordering::Relaxed);
         let f_ref = stats.conn_fail_refused.load(Ordering::Relaxed);
-        let f_res = stats.conn_fail_resource.load(Ordering::Relaxed);
-        let f_oth = stats.conn_fail_other.load(Ordering::Relaxed);
+        let f_rem = stats.conn_remote_closed.load(Ordering::Relaxed);
+        let f_to = stats.conn_fail_timeout.load(Ordering::Relaxed);
         let conn_row2 = format!(
-            "[会话明细] 累计拨号: {c_att}  |  远端回收补建: {c_rec}  |  真实失败(超时:{f_to} / 拒绝:{f_ref} / 系统资源:{f_res} / 其他:{f_oth})"
+            "[连接归属] 存活: {c_cur} (目标:{c_tgt})  |  原始: {orig_ok}/{orig_att}  |  补建(不计入原始): {rep_ok}/{rep_att}  |  本机:{f_loc}  远拒:{f_ref}  远闭:{f_rem}  超时:{f_to}"
         );
         unsafe { set_cached_text(self.lbl_conn_row2, &mut self.cache.conn_row2, conn_row2) };
+
+        let t_healthy = stats.conn_targets_healthy.load(Ordering::Relaxed);
+        let t_total = stats.conn_targets_total.load(Ordering::Relaxed);
+        let wan_summary = stats.wan_distribution_summary();
+        let conn_row3 = format!(
+            "[WAN 分布] 健康目标: {t_healthy}/{t_total}  |  建连速率: {c_cps}/s  |  RTT: {c_rtt} ms  |  分流: {wan_summary}"
+        );
+        unsafe { set_cached_text(self.lbl_conn_row3, &mut self.cache.conn_row3, conn_row3) };
 
         let up_bps = stats.up_bps_current.load(Ordering::Relaxed);
         let up_peak = stats.up_bps_peak.load(Ordering::Relaxed);
@@ -1491,6 +1511,18 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let lbl_conn_row3 = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_ui,
+                )
+            };
             let lbl_up_row = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -1590,6 +1622,7 @@ unsafe extern "system" fn wnd_proc(
                 grp_metrics,
                 lbl_conn_row1,
                 lbl_conn_row2,
+                lbl_conn_row3,
                 lbl_up_row,
                 lbl_down_row,
                 grp_log,
@@ -1613,8 +1646,8 @@ unsafe extern "system" fn wnd_proc(
                 96
             };
             let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = scale_px(900, dpi);
-            mmi.ptMinTrackSize.y = scale_px(660, dpi);
+            mmi.ptMinTrackSize.x = scale_px(940, dpi);
+            mmi.ptMinTrackSize.y = scale_px(690, dpi);
             LRESULT(0)
         }
         m if m == WM_SYSCOLORCHANGE as u32 => {
@@ -1673,7 +1706,7 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         ui.theme.colors.active
                     }
-                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row2 {
+                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row3 {
                     ui.theme.colors.text_muted
                 } else {
                     ui.theme.colors.text_primary
@@ -1782,8 +1815,14 @@ unsafe extern "system" fn wnd_proc(
                     ID_BTN_HELP => {
                         let help_text = concat!(
                             "1. 纯内存原则：配置、统计和日志全部保存在进程内存中，退出即销毁，不读写本地磁盘或注册表。\n\n",
-                            "2. 并发连接数探测（参考路由器 WAN 探测原理）：先对目标节点执行并行预探测，剔除不可达端口或无效 IPv6；随后按令牌平滑建连并监控握手延迟 (RTT)，远端空闲断开自动补建而不计入本地失败；开启“持续加压”可在达到上限或稳定水位后持续维持与尝试向上探测。\n\n",
-                            "3. 上/下行带宽压测：下行流式拉取后直接在内存中丢弃；上行在内存中生成伪随机块推送，支持 HTTP POST 与 tcp://ip:port 裸流。"
+                            "2. 多目标健康检查与连接归属：\n",
+                            "  · 预探测验证每个目标的 DNS 与 TCP 握手稳定性，自动剔除不支持 TCP 或不可达端口；\n",
+                            "  · 严格区分【本机失败 / 远端拒绝 / 远端关闭 / 连接超时】四类归属；\n",
+                            "  · 补建连接独立计数，绝不将补建数量计入原始成功率。\n\n",
+                            "3. 分级结果与多 WAN 说明：\n",
+                            "  · 分级报告【瞬时建连】【稳定并发】【长时间保持】三项指标；\n",
+                            "  · 多 WAN 负载均衡通常是一条 TCP 连接走单条 WAN 出口，只有多个连接分散至不同目标 IP:端口 才可观察多线分流效果。\n\n",
+                            "4. 上/下行带宽压测：下行流式拉取后直接在内存中丢弃；上行在内存中生成伪随机块推送，支持 HTTP POST 与 tcp://ip:port 裸流。"
                         );
                         let wide = to_wide_null(help_text);
                         unsafe {

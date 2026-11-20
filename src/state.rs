@@ -1,4 +1,5 @@
-//! Pure in-memory application state, atomic metrics, ring-buffer logs, and target defaults.
+//! Pure in-memory application state, atomic metrics, per-target WAN stats,
+//! ring-buffer logs, and target defaults.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -9,9 +10,9 @@ use parking_lot::Mutex;
 use crate::sys_stats::format_local_hms;
 
 pub const DEFAULT_TCP_TARGETS: &str = "\
-223.5.5.5:53, 223.5.5.5:443, 223.6.6.6:53, 223.6.6.6:443, \
-119.29.29.29:53, 119.29.29.29:443, 180.76.76.76:53, 180.76.76.76:443, \
-114.114.114.114:53, 114.114.115.115:53, 180.184.1.1:53, \
+223.5.5.5:443, 223.6.6.6:443, \
+119.29.29.29:443, 180.76.76.76:443, \
+1.12.12.12:443, 223.5.5.5:53, \
 www.baidu.com:80, www.baidu.com:443, www.qq.com:80, www.qq.com:443, \
 www.aliyun.com:443, www.taobao.com:443, www.163.com:80, www.jd.com:443, www.bilibili.com:443";
 
@@ -103,24 +104,147 @@ pub fn parse_target_list(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Per-target metrics for multi-target testing, health verification,
+/// connection attribution, and multi-WAN distribution observation.
+pub struct TargetMetrics {
+    pub label: String,
+    pub resolved_addr: String,
+    pub healthy: bool,
+    pub health_note: String,
+    pub probe_rtt_ms: u64,
+
+    pub active_conns: AtomicUsize,
+    pub peak_conns: AtomicUsize,
+    pub orig_attempts: AtomicU64,
+    pub orig_success: AtomicU64,
+    pub replenish_attempts: AtomicU64,
+    pub replenish_success: AtomicU64,
+
+    pub fail_local: AtomicU64,
+    pub fail_refused: AtomicU64,
+    pub remote_closed: AtomicU64,
+    pub fail_timeout: AtomicU64,
+
+    pub rtt_sum_ms: AtomicU64,
+    pub rtt_cnt: AtomicU64,
+}
+
+impl TargetMetrics {
+    pub fn healthy(label: String, resolved_addr: String, probe_rtt_ms: u64) -> Self {
+        Self {
+            label,
+            resolved_addr,
+            healthy: true,
+            health_note: format!("TCP 可达 ({probe_rtt_ms} ms)"),
+            probe_rtt_ms,
+            active_conns: AtomicUsize::new(0),
+            peak_conns: AtomicUsize::new(0),
+            orig_attempts: AtomicU64::new(0),
+            orig_success: AtomicU64::new(0),
+            replenish_attempts: AtomicU64::new(0),
+            replenish_success: AtomicU64::new(0),
+            fail_local: AtomicU64::new(0),
+            fail_refused: AtomicU64::new(0),
+            remote_closed: AtomicU64::new(0),
+            fail_timeout: AtomicU64::new(0),
+            rtt_sum_ms: AtomicU64::new(0),
+            rtt_cnt: AtomicU64::new(0),
+        }
+    }
+
+    pub fn unhealthy(label: String, reason: String) -> Self {
+        Self {
+            label,
+            resolved_addr: "-".to_string(),
+            healthy: false,
+            health_note: reason,
+            probe_rtt_ms: 0,
+            active_conns: AtomicUsize::new(0),
+            peak_conns: AtomicUsize::new(0),
+            orig_attempts: AtomicU64::new(0),
+            orig_success: AtomicU64::new(0),
+            replenish_attempts: AtomicU64::new(0),
+            replenish_success: AtomicU64::new(0),
+            fail_local: AtomicU64::new(0),
+            fail_refused: AtomicU64::new(0),
+            remote_closed: AtomicU64::new(0),
+            fail_timeout: AtomicU64::new(0),
+            rtt_sum_ms: AtomicU64::new(0),
+            rtt_cnt: AtomicU64::new(0),
+        }
+    }
+
+    pub fn update_peak(&self, cur: usize) {
+        let mut prev = self.peak_conns.load(Ordering::Relaxed);
+        while cur > prev {
+            match self.peak_conns.compare_exchange_weak(
+                prev,
+                cur,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    pub fn record_rtt(&self, ms: u64) {
+        self.rtt_sum_ms.fetch_add(ms.max(1), Ordering::Relaxed);
+        self.rtt_cnt.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn avg_rtt_ms(&self) -> u64 {
+        let cnt = self.rtt_cnt.load(Ordering::Relaxed);
+        if cnt == 0 {
+            self.probe_rtt_ms
+        } else {
+            self.rtt_sum_ms.load(Ordering::Relaxed) / cnt
+        }
+    }
+
+    pub fn orig_success_rate_pct(&self) -> f64 {
+        let att = self.orig_attempts.load(Ordering::Relaxed);
+        if att == 0 {
+            0.0
+        } else {
+            (self.orig_success.load(Ordering::Relaxed) as f64) * 100.0 / (att as f64)
+        }
+    }
+}
+
 pub struct SharedStats {
     mode: AtomicU8,
 
-    // Connection tester counters
+    // Connection tester live & tiered counters
     pub conn_current: AtomicUsize,
     pub conn_peak: AtomicUsize,
     pub conn_stable_max: AtomicUsize,
+    pub conn_long_hold_max: AtomicUsize,
+    pub conn_hold_elapsed_secs: AtomicU64,
     pub conn_target_probe: AtomicUsize,
-    pub conn_attempts: AtomicU64,
-    pub conn_established_total: AtomicU64,
+
+    // Strict separation: original attempts/success vs. replenishment attempts/success
+    pub conn_orig_attempts: AtomicU64,
+    pub conn_orig_success: AtomicU64,
+    pub conn_replenish_attempts: AtomicU64,
+    pub conn_replenish_success: AtomicU64,
+
+    // Instant CPS & peak CPS + RTT
     pub conn_per_sec: AtomicU64,
+    pub conn_cps_peak: AtomicU64,
     pub conn_rtt_ms: AtomicU64,
+
+    // Connection failure/closure attribution (4 distinct buckets)
+    pub conn_fail_local: AtomicU64,
+    pub conn_fail_refused: AtomicU64,
     pub conn_remote_closed: AtomicU64,
     pub conn_fail_timeout: AtomicU64,
-    pub conn_fail_refused: AtomicU64,
-    pub conn_fail_resource: AtomicU64,
-    pub conn_fail_other: AtomicU64,
+
     pub conn_holding: AtomicBool,
+    pub conn_targets_total: AtomicUsize,
+    pub conn_targets_healthy: AtomicUsize,
+    pub target_metrics: Mutex<Vec<Arc<TargetMetrics>>>,
 
     // Uploader counters
     pub up_bytes_total: AtomicU64,
@@ -148,17 +272,24 @@ impl Default for SharedStats {
             conn_current: AtomicUsize::new(0),
             conn_peak: AtomicUsize::new(0),
             conn_stable_max: AtomicUsize::new(0),
+            conn_long_hold_max: AtomicUsize::new(0),
+            conn_hold_elapsed_secs: AtomicU64::new(0),
             conn_target_probe: AtomicUsize::new(0),
-            conn_attempts: AtomicU64::new(0),
-            conn_established_total: AtomicU64::new(0),
+            conn_orig_attempts: AtomicU64::new(0),
+            conn_orig_success: AtomicU64::new(0),
+            conn_replenish_attempts: AtomicU64::new(0),
+            conn_replenish_success: AtomicU64::new(0),
             conn_per_sec: AtomicU64::new(0),
+            conn_cps_peak: AtomicU64::new(0),
             conn_rtt_ms: AtomicU64::new(0),
+            conn_fail_local: AtomicU64::new(0),
+            conn_fail_refused: AtomicU64::new(0),
             conn_remote_closed: AtomicU64::new(0),
             conn_fail_timeout: AtomicU64::new(0),
-            conn_fail_refused: AtomicU64::new(0),
-            conn_fail_resource: AtomicU64::new(0),
-            conn_fail_other: AtomicU64::new(0),
             conn_holding: AtomicBool::new(false),
+            conn_targets_total: AtomicUsize::new(0),
+            conn_targets_healthy: AtomicUsize::new(0),
+            target_metrics: Mutex::new(Vec::new()),
             up_bytes_total: AtomicU64::new(0),
             up_active_streams: AtomicUsize::new(0),
             up_bps_current: AtomicU64::new(0),
@@ -188,17 +319,24 @@ impl SharedStats {
         self.conn_current.store(0, Ordering::Relaxed);
         self.conn_peak.store(0, Ordering::Relaxed);
         self.conn_stable_max.store(0, Ordering::Relaxed);
+        self.conn_long_hold_max.store(0, Ordering::Relaxed);
+        self.conn_hold_elapsed_secs.store(0, Ordering::Relaxed);
         self.conn_target_probe.store(0, Ordering::Relaxed);
-        self.conn_attempts.store(0, Ordering::Relaxed);
-        self.conn_established_total.store(0, Ordering::Relaxed);
+        self.conn_orig_attempts.store(0, Ordering::Relaxed);
+        self.conn_orig_success.store(0, Ordering::Relaxed);
+        self.conn_replenish_attempts.store(0, Ordering::Relaxed);
+        self.conn_replenish_success.store(0, Ordering::Relaxed);
         self.conn_per_sec.store(0, Ordering::Relaxed);
+        self.conn_cps_peak.store(0, Ordering::Relaxed);
         self.conn_rtt_ms.store(0, Ordering::Relaxed);
+        self.conn_fail_local.store(0, Ordering::Relaxed);
+        self.conn_fail_refused.store(0, Ordering::Relaxed);
         self.conn_remote_closed.store(0, Ordering::Relaxed);
         self.conn_fail_timeout.store(0, Ordering::Relaxed);
-        self.conn_fail_refused.store(0, Ordering::Relaxed);
-        self.conn_fail_resource.store(0, Ordering::Relaxed);
-        self.conn_fail_other.store(0, Ordering::Relaxed);
         self.conn_holding.store(false, Ordering::Relaxed);
+        self.conn_targets_total.store(0, Ordering::Relaxed);
+        self.conn_targets_healthy.store(0, Ordering::Relaxed);
+        self.target_metrics.lock().clear();
     }
 
     pub fn reset_upload_run(&self) {
@@ -223,6 +361,21 @@ impl SharedStats {
             match self.conn_peak.compare_exchange_weak(
                 prev,
                 current,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => prev = actual,
+            }
+        }
+    }
+
+    pub fn update_cps_peak(&self, cps: u64) {
+        let mut prev = self.conn_cps_peak.load(Ordering::Relaxed);
+        while cps > prev {
+            match self.conn_cps_peak.compare_exchange_weak(
+                prev,
+                cps,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             ) {
@@ -260,6 +413,46 @@ impl SharedStats {
                 Err(actual) => prev = actual,
             }
         }
+    }
+
+    pub fn orig_success_rate_pct(&self) -> f64 {
+        let att = self.conn_orig_attempts.load(Ordering::Relaxed);
+        if att == 0 {
+            0.0
+        } else {
+            (self.conn_orig_success.load(Ordering::Relaxed) as f64) * 100.0 / (att as f64)
+        }
+    }
+
+    /// Concise summary of live connection dispersion across top healthy WAN targets.
+    pub fn wan_distribution_summary(&self) -> String {
+        let guard = self.target_metrics.lock();
+        let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
+        if healthy.is_empty() {
+            return "等待健康检查...".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        let mut sorted = healthy;
+        sorted.sort_by(|a, b| {
+            b.active_conns
+                .load(Ordering::Relaxed)
+                .cmp(&a.active_conns.load(Ordering::Relaxed))
+                .then_with(|| {
+                    b.peak_conns
+                        .load(Ordering::Relaxed)
+                        .cmp(&a.peak_conns.load(Ordering::Relaxed))
+                })
+        });
+        for t in sorted.iter().take(4) {
+            let act = t.active_conns.load(Ordering::Relaxed);
+            let rtt = t.avg_rtt_ms();
+            let pct = t.orig_success_rate_pct();
+            parts.push(format!("{}({act}条/{pct:.0}%/{rtt}ms)", t.label));
+        }
+        if sorted.len() > 4 {
+            parts.push(format!("等{}个节点", sorted.len()));
+        }
+        parts.join(" · ")
     }
 }
 
@@ -334,7 +527,7 @@ impl Default for AppState {
     fn default() -> Self {
         let log = Arc::new(MemoryLog::new(400));
         log.push("程序已启动（纯内存模式：无配置文件、无日志落盘、无临时文件）。");
-        log.push("提示：仅用于测试本机出口能力或明确授权目标，请勿滥用公网压测。");
+        log.push("多 WAN 提示：单条 TCP 连接通常仅走单条出口，多目标并发连接才会分散至多条线路。");
         Self {
             stats: Arc::new(SharedStats::default()),
             log,
@@ -398,7 +591,17 @@ mod tests {
     fn test_format_helpers() {
         assert_eq!(format_mbps(125_000_000), "125.00 Mbps");
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(10 * 1024 * 1024), "10.00 MB");
+        assert_eq!(format_bytes(2048), "2.00 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.00 MB");
+    }
+
+    #[test]
+    fn test_orig_success_rate_not_masked_by_replenish() {
+        let stats = SharedStats::default();
+        stats.conn_orig_attempts.store(100, Ordering::Relaxed);
+        stats.conn_orig_success.store(75, Ordering::Relaxed);
+        stats.conn_replenish_attempts.store(50, Ordering::Relaxed);
+        stats.conn_replenish_success.store(50, Ordering::Relaxed);
+        assert!((stats.orig_success_rate_pct() - 75.0).abs() < 0.001);
     }
 }
