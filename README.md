@@ -7,10 +7,10 @@
 1. **纯内存运行（零磁盘读写）**
    - 禁止 `std::fs`、不生成配置文件、不写日志文件、不写临时文件、不修改注册表。
    - 预生成 1 MiB 不可压缩随机内存载荷（xorshift64*）供多流复用；日志采用内存环形缓冲（最多保留 400 条）。
-2. **原生 Win32 API 界面**
-   - 直接基于官方 `microsoft/windows-rs` 最新版（`windows = 0.100.0`，tag `74`）调用 Win32 窗口、控件、DPI 感知、`SetTimer` 刷新和 `iphlpapi` / `GetProcessHandleCount` 系统指标，无重型前端运行时。
+2. **原生 Win32 API 界面（零闪烁 + 高 DPI 自适应）**
+   - 直接基于官方 `microsoft/windows-rs` 最新版（`windows = 0.100.0`，tag `74`）调用 Win32 窗口、编译期 Common Controls v6 清单、`WS_CLIPCHILDREN` + `BeginDeferWindowPos` 无闪烁布局、`LabelCache` 差异文本刷新、`PerMonitorV2` 动态字体缩放和 `iphlpapi` / `GetProcessHandleCount` 系统指标，无重型前端运行时。
 3. **三大测试模块**
-   - **最大并发 TCP 连接数探测 (`ConnTester`)**：使用 `tokio::net::TcpSocket` + `socket2` TCP Keepalive，按阶梯递增 + 稳定观察窗口 + 二分收敛探测最大稳定并发连接数，并分类统计超时、拒绝/重置、系统端口/缓冲区资源受限等失败原因。
+   - **最大并发 TCP 连接数探测 (`ConnTester`)**：参考路由器 WAN 口探测原理，先执行并行预探测剔除不可达端口或无效 IPv6，再通过多公网 IP/端口四元组离散、信号量与 RTT 感知平滑建连、远端空闲断开自动补建，以及快速阶梯递增与“持续加压/维持连接”模式，实时统计存活会话、峰值并发、建连速率（conn/s）、握手延迟（ms）与分类错误。
    - **持续上行带宽压测 (`BandwidthUploader`)**：支持 HTTP/HTTPS POST 流式上传（含 413 自适应分片）及 `tcp://ip:port` 原始 TCP 持续发送。
    - **持续下行带宽压测 (`BandwidthDownloader`)**：多流并发请求公网大文件/测速流，收到的数据块直接在内存中丢弃并统计实时/峰值 Mbps 与累计流量。
 

@@ -740,7 +740,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
             ..Default::default()
         };
 
-        if RegisterClassExW(&wc) == 0 {
+        if RegisterClassExW(&wc).0 == 0 {
             return Err("注册 Win32 窗口类失败".to_string());
         }
 
