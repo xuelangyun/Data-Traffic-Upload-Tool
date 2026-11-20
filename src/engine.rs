@@ -58,8 +58,11 @@ impl EngineHandle {
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
+        self.spawn_conn_rate_sampler(cancel.clone());
         self.runtime.spawn(async move {
-            run_conn_test(config, state.stats.clone(), state.log.clone(), cancel).await;
+            run_conn_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
+            cancel.cancel();
+            state.stats.conn_per_sec.store(0, Ordering::Relaxed);
             state.stats.set_mode(AppMode::Idle);
         });
         true
@@ -118,6 +121,35 @@ impl EngineHandle {
         }
         self.state.stats.set_mode(next);
         true
+    }
+
+    fn spawn_conn_rate_sampler(&self, cancel: Arc<CancelToken>) {
+        let stats = self.state.stats.clone();
+        self.runtime.spawn(async move {
+            let mut last_time = Instant::now();
+            let mut last_estab: u64 = 0;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+
+                let now = Instant::now();
+                let secs = now.duration_since(last_time).as_secs_f64();
+                if secs <= 0.0 {
+                    continue;
+                }
+                let total = stats.conn_established_total.load(Ordering::Relaxed);
+                let delta = total.saturating_sub(last_estab);
+                last_estab = total;
+                last_time = now;
+
+                let cps = ((delta as f64) / secs).round().max(0.0) as u64;
+                stats.conn_per_sec.store(cps, Ordering::Relaxed);
+            }
+        });
     }
 
     fn install_cancel(&self) -> Arc<CancelToken> {

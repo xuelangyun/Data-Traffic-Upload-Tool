@@ -2,13 +2,18 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
 use crate::sys_stats::format_local_hms;
 
-pub const DEFAULT_TCP_TARGETS: &str = "223.5.5.5:443, 223.6.6.6:443, 119.29.29.29:443, 180.76.76.76:443, www.baidu.com:443, www.qq.com:443, www.aliyun.com:443";
+pub const DEFAULT_TCP_TARGETS: &str = "\
+223.5.5.5:53, 223.5.5.5:443, 223.6.6.6:53, 223.6.6.6:443, \
+119.29.29.29:53, 119.29.29.29:443, 180.76.76.76:53, 180.76.76.76:443, \
+114.114.114.114:53, 114.114.115.115:53, 180.184.1.1:53, \
+www.baidu.com:80, www.baidu.com:443, www.qq.com:80, www.qq.com:443, \
+www.aliyun.com:443, www.taobao.com:443, www.163.com:80, www.jd.com:443, www.bilibili.com:443";
 
 pub const DEFAULT_DOWNLOAD_TARGETS: &str = "\
 https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
@@ -20,8 +25,8 @@ https://speed.cloudflare.com/__down?bytes=104857600";
 pub const DEFAULT_UPLOAD_TARGETS: &str = "https://speed.cloudflare.com/__up";
 
 pub const DEFAULT_STREAM_CONCURRENCY: usize = 16;
-pub const DEFAULT_MAX_CONNS_CAP: usize = 10_000;
-pub const DEFAULT_HOLD_SECS: u64 = 5;
+pub const DEFAULT_MAX_CONNS_CAP: usize = 30_000;
+pub const DEFAULT_HOLD_SECS: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -45,7 +50,7 @@ impl AppMode {
     pub fn label_zh(self) -> &'static str {
         match self {
             Self::Idle => "空闲 (就绪)",
-            Self::TestingConn => "最大并发 TCP 连接数测试中...",
+            Self::TestingConn => "并发 TCP 连接数持续探测中...",
             Self::Uploading => "持续上行带宽压测中...",
             Self::Downloading => "持续下行带宽压测中...",
         }
@@ -57,6 +62,7 @@ pub struct TestConfig {
     pub stream_concurrency: usize,
     pub max_conn_cap: usize,
     pub hold_secs: u64,
+    pub continuous_conn: bool,
     pub tcp_targets: Vec<String>,
     pub upload_targets: Vec<String>,
     pub download_targets: Vec<String>,
@@ -68,6 +74,7 @@ impl Default for TestConfig {
             stream_concurrency: DEFAULT_STREAM_CONCURRENCY,
             max_conn_cap: DEFAULT_MAX_CONNS_CAP,
             hold_secs: DEFAULT_HOLD_SECS,
+            continuous_conn: true,
             tcp_targets: parse_target_list(DEFAULT_TCP_TARGETS),
             upload_targets: parse_target_list(DEFAULT_UPLOAD_TARGETS),
             download_targets: parse_target_list(DEFAULT_DOWNLOAD_TARGETS),
@@ -92,10 +99,15 @@ pub struct SharedStats {
     pub conn_stable_max: AtomicUsize,
     pub conn_target_probe: AtomicUsize,
     pub conn_attempts: AtomicU64,
+    pub conn_established_total: AtomicU64,
+    pub conn_per_sec: AtomicU64,
+    pub conn_rtt_ms: AtomicU64,
+    pub conn_remote_closed: AtomicU64,
     pub conn_fail_timeout: AtomicU64,
     pub conn_fail_refused: AtomicU64,
     pub conn_fail_resource: AtomicU64,
     pub conn_fail_other: AtomicU64,
+    pub conn_holding: AtomicBool,
 
     // Uploader counters
     pub up_bytes_total: AtomicU64,
@@ -125,10 +137,15 @@ impl Default for SharedStats {
             conn_stable_max: AtomicUsize::new(0),
             conn_target_probe: AtomicUsize::new(0),
             conn_attempts: AtomicU64::new(0),
+            conn_established_total: AtomicU64::new(0),
+            conn_per_sec: AtomicU64::new(0),
+            conn_rtt_ms: AtomicU64::new(0),
+            conn_remote_closed: AtomicU64::new(0),
             conn_fail_timeout: AtomicU64::new(0),
             conn_fail_refused: AtomicU64::new(0),
             conn_fail_resource: AtomicU64::new(0),
             conn_fail_other: AtomicU64::new(0),
+            conn_holding: AtomicBool::new(false),
             up_bytes_total: AtomicU64::new(0),
             up_active_streams: AtomicUsize::new(0),
             up_bps_current: AtomicU64::new(0),
@@ -160,10 +177,15 @@ impl SharedStats {
         self.conn_stable_max.store(0, Ordering::Relaxed);
         self.conn_target_probe.store(0, Ordering::Relaxed);
         self.conn_attempts.store(0, Ordering::Relaxed);
+        self.conn_established_total.store(0, Ordering::Relaxed);
+        self.conn_per_sec.store(0, Ordering::Relaxed);
+        self.conn_rtt_ms.store(0, Ordering::Relaxed);
+        self.conn_remote_closed.store(0, Ordering::Relaxed);
         self.conn_fail_timeout.store(0, Ordering::Relaxed);
         self.conn_fail_refused.store(0, Ordering::Relaxed);
         self.conn_fail_resource.store(0, Ordering::Relaxed);
         self.conn_fail_other.store(0, Ordering::Relaxed);
+        self.conn_holding.store(false, Ordering::Relaxed);
     }
 
     pub fn reset_upload_run(&self) {
@@ -273,7 +295,6 @@ impl MemoryLog {
             return (cur_gen, latest_seq, all, true);
         }
 
-        // If ring buffer evicted unseen lines or reset, request full refresh
         if let Some((first_seq, _)) = guard.front()
             && seen_seq > 0
             && *first_seq > seen_seq + 1
