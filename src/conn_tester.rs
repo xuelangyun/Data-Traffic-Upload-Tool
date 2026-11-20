@@ -432,16 +432,16 @@ fn spawn_slot(
             };
             drop(permit);
 
-            let stream = match connect_res {
+            let (stream, local_egress_ip) = match connect_res {
                 Ok(Ok(s)) => {
                     let rtt = t0.elapsed().as_millis().max(1) as u64;
                     update_rtt_ewma(&stats, rtt);
                     target.metrics.record_rtt(rtt);
-                    if let Ok(local) = s.local_addr() {
-                        let ip = local.ip().to_string();
-                        target.metrics.record_egress(ip);
+                    let local_egress_ip = s.local_addr().ok().map(|local| local.ip().to_string());
+                    if let Some(ip) = &local_egress_ip {
+                        target.metrics.record_egress_connected(ip.clone());
                     }
-                    s
+                    (s, local_egress_ip)
                 }
                 Ok(Err(e)) => {
                     let local = classify_connect_error(&e) == ConnectErrorBucket::LocalFailure;
@@ -522,6 +522,9 @@ fn spawn_slot(
 
             target.metrics.active_conns.fetch_sub(1, Ordering::AcqRel);
             stats.conn_current.fetch_sub(1, Ordering::AcqRel);
+            if let Some(local_ip) = local_egress_ip.as_deref() {
+                target.metrics.release_egress(local_ip);
+            }
 
             if remote_evicted && !global_cancel.is_cancelled() && !slot_cancel.is_cancelled() {
                 stats.conn_remote_closed.fetch_add(1, Ordering::Relaxed);
