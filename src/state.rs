@@ -33,11 +33,7 @@ https://test.nju.edu.cn/backend/empty.php, \
 http://speed.neu.edu.cn/empty.php, \
 https://iptv.tsinghua.edu.cn/st/empty.php, \
 https://speed.nuaa.edu.cn/backend/empty.php, \
-https://speed.cloudflare.com/__up, \
-https://arms-retcode.aliyuncs.com/r.png, \
-https://snowflake.qq.com/, \
-https://gatherer.m.qq.com/, \
-https://galileotelemetry.tencent.com/collect";
+https://speed.cloudflare.com/__up";
 
 pub const DEFAULT_STREAM_CONCURRENCY: usize = 16;
 pub const DEFAULT_MAX_CONNS_CAP: usize = 30_000;
@@ -261,7 +257,6 @@ pub struct NodeSpeedMetrics {
     pub probe_bps: AtomicU64,
     pub ema_bps: AtomicU64,
     pub bytes_http_accepted: AtomicU64,
-    pub bytes_client: AtomicU64,
     pub requests_ok: AtomicU64,
     pub requests_fail: AtomicU64,
     pub consecutive_fails: AtomicU32,
@@ -302,7 +297,6 @@ impl NodeSpeedMetrics {
             probe_bps: AtomicU64::new(probe_bps),
             ema_bps: AtomicU64::new(probe_bps),
             bytes_http_accepted: AtomicU64::new(0),
-            bytes_client: AtomicU64::new(0),
             requests_ok: AtomicU64::new(0),
             requests_fail: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
