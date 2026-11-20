@@ -821,36 +821,42 @@ impl SharedStats {
         for target in guard.iter().filter(|target| target.healthy) {
             let observations = target.egress_map.lock().clone();
             let active_by_ip = target.egress_active.lock().clone();
-            if observations.is_empty() {
-                let active = target.active_conns.load(Ordering::Relaxed);
-                if active > 0 {
-                    grouped
-                        .entry("未识别".to_string())
-                        .or_default()
-                        .push(WanRow {
-                            egress_ip: "未识别".to_string(),
-                            label: target.label.clone(),
-                            resolved: target.resolved_addr.clone(),
-                            active,
-                            observations: 0,
-                            pct: target.orig_success_rate_pct(),
-                            rtt: target.avg_rtt_ms(),
-                            share: 0.0,
-                        });
-                }
-                continue;
-            }
+            let known_active: usize = active_by_ip.values().sum();
 
-            for (ip, count) in observations {
+            // Show only currently active source-IP groups. Historical counts remain
+            // available as context, but stale source IPs do not occupy rows forever.
+            for (ip, active) in active_by_ip {
+                let count = observations.get(&ip).copied().unwrap_or(0);
                 grouped
                     .entry(ip.clone())
                     .or_default()
                     .push(WanRow {
-                        egress_ip: ip.clone(),
+                        egress_ip: ip,
                         label: target.label.clone(),
                         resolved: target.resolved_addr.clone(),
-                        active: active_by_ip.get(&ip).copied().unwrap_or(0),
+                        active,
                         observations: count,
+                        pct: target.orig_success_rate_pct(),
+                        rtt: target.avg_rtt_ms(),
+                        share: 0.0,
+                    });
+            }
+
+            // A small fallback row makes connections visible if local_addr() failed.
+            let unknown_active = target
+                .active_conns
+                .load(Ordering::Relaxed)
+                .saturating_sub(known_active);
+            if unknown_active > 0 {
+                grouped
+                    .entry("未识别".to_string())
+                    .or_default()
+                    .push(WanRow {
+                        egress_ip: "未识别".to_string(),
+                        label: target.label.clone(),
+                        resolved: target.resolved_addr.clone(),
+                        active: unknown_active,
+                        observations: 0,
                         pct: target.orig_success_rate_pct(),
                         rtt: target.avg_rtt_ms(),
                         share: 0.0,
