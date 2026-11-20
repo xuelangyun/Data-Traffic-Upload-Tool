@@ -227,6 +227,27 @@ impl TargetMetrics {
             (self.orig_success.load(Ordering::Relaxed) as f64) * 100.0 / (att as f64)
         }
     }
+
+    pub fn record_egress(&self, local_ip: String) {
+        if local_ip.is_empty() || local_ip=="0.0.0.0" { return; }
+        let mut m = self.egress_map.lock();
+        *m.entry(local_ip).or_insert(0) += 1;
+    }
+    pub fn egress_summary(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        let top = v.into_iter().take(2).map(|(ip,c)| format!("{}({})", ip, c)).collect::<Vec<_>>().join(",");
+        top
+    }
+    pub fn egress_primary_ip(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        v[0].0.clone()
+    }
 }
 
 /// Per-IP endpoint stats under a bandwidth target (for multi-IP / multi-WAN dispersion).
