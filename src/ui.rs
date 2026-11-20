@@ -57,7 +57,7 @@ struct LabelCache {
     // Table caches: keep last rendered cell to avoid flicker
     metrics_cells: [[String; 6]; 8],
     bandwidth_cells: [[String; 6]; 4],
-    wan_cells: Vec<[String; 6]>,
+    wan_cells: Vec<[String; 3]>,
 }
 
 struct SystemColors {
@@ -509,6 +509,7 @@ struct UiState {
     last_mode_active: Option<bool>,
     log_gen: u64,
     log_seq: u64,
+    wan_layout_rows: usize,
 
     // Header
     lbl_title: HWND,
@@ -857,9 +858,9 @@ impl UiState {
         defer_bottom(&mut hdwp, self.grp_bandwidth, margin, bw_top, w, bw_h);
         defer(&mut hdwp, self.lv_bandwidth, cfg_x, bw_top + metrics_title_off, cfg_inner_w, bw_h - metrics_title_off - s(4));
         y = bw_top + bw_h + s(6);
-        // WAN table: header + up to 8 rows
+        // WAN table: grow vertically with the number of unique public egress IPs.
         let wan_top = y;
-        let wan_rows = 8;
+        let wan_rows = self.wan_layout_rows.max(1) as i32;
         let wan_h = metrics_title_off + small_row_h + s(22) + wan_rows * small_row_h + s(8);
         defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h);
         // Inside WAN: lbl_wan_ip small row at top of inner area, then ListView occupies rest
@@ -1138,36 +1139,33 @@ impl UiState {
         let wan_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last == 0 {
-                String::new()
+                "尚未成功探测".to_string()
             } else {
                 let now_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
                 let secs = now_ms.saturating_sub(last) / 1000;
-                if secs < 120 { format!(" · {secs}s前") } else { format!(" · {}m前", secs / 60) }
+                if secs < 120 { format!("{secs}s 前更新") } else { format!("{}m 前更新", secs / 60) }
             }
         };
-        let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw == "检测中..." {
-            "检测中".to_string()
-        } else {
-            wan_ip_raw
-        };
-        unsafe {
-            set_cached_text(
-                self.lbl_wan_ip,
-                &mut self.cache.wan_ip,
-                format!("公网出口观测：{wan_ip_disp}{wan_age}"),
-            )
-        };
 
-        let wan_rows = stats.wan_vertical_rows();
+        let wan_rows = stats.egress_ip_rows();
+        let probe_hits: usize = wan_rows.iter().map(|row| row.hits).sum();
+        let wan_summary = format!(
+            "发现 {} 个公网 IP · {} 次服务响应 · {}",
+            wan_rows.len(),
+            probe_hits,
+            wan_age
+        );
+        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_summary) };
+
         let desired_rows = wan_rows.len().max(1);
         {
             let lv = self.lv_wan;
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
 
-            // Insert/delete ListView items with the actual result count: no fixed eight-row cap.
+            // Dynamic ListView items: one row per unique public egress IP.
             while self.cache.wan_cells.len() < desired_rows {
                 let row_idx = self.cache.wan_cells.len();
                 unsafe { lv_insert_row(lv, row_idx as i32) };
@@ -1179,34 +1177,30 @@ impl UiState {
                 self.cache.wan_cells.pop();
             }
 
-            let mut previous_ip = String::new();
             if wan_rows.is_empty() {
-                let placeholder = if mode == AppMode::Idle { "开始 TCP 测试后显示" } else { "等待活动连接..." };
-                let values = ["-", placeholder, "-", "-", "-", "-"];
+                let values = ["等待公网 IP 探测", "-", "查询服务暂不可用时保留上次成功结果"];
                 for (col, value) in values.iter().enumerate() {
                     set_lv_cell(lv, 0, col as i32, &mut self.cache.wan_cells[0][col], (*value).to_string());
                 }
             } else {
                 for (idx, row) in wan_rows.iter().enumerate() {
-                    let source_ip = if row.egress_ip == previous_ip {
-                        String::new()
-                    } else {
-                        previous_ip = row.egress_ip.clone();
-                        row.egress_ip.clone()
-                    };
                     let values = [
-                        source_ip,
-                        format!("{} · {}", row.label, row.resolved),
-                        format!("{}/{}", row.active, row.observations),
-                        format!("{:.1}%", row.pct),
-                        format!("{}ms", row.rtt),
-                        format!("{:.1}%", row.share),
+                        row.ip.clone(),
+                        format!("{} 个", row.hits),
+                        row.providers.join(" · "),
                     ];
                     for (col, value) in values.iter().enumerate() {
-                        set_lv_cell(lv, idx as i32, col as i32, &mut self.cache.wan_cells[idx][col], value.clone());
+                        set_lv_cell(
+                            lv,
+                            idx as i32,
+                            col as i32,
+                            &mut self.cache.wan_cells[idx][col],
+                            value.clone(),
+                        );
                     }
                 }
             }
+
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
             let _ = unsafe { InvalidateRect(Some(lv), None, true) };
         }
@@ -1755,14 +1749,11 @@ unsafe extern "system" fn wnd_proc(
             let lv_wan = unsafe { create_listview(hwnd, hinst, theme.font_small) };
             unsafe {
                 let total_w = 860;
-                lv_insert_column(lv_wan, 0, "本地源 IP", total_w*18/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_wan, 1, "目标", total_w*30/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_wan, 2, "活动/累计", total_w*14/100, LVCFMT_CENTER as i32);
-                lv_insert_column(lv_wan, 3, "成功率", total_w*12/100, LVCFMT_RIGHT as i32);
-                lv_insert_column(lv_wan, 4, "RTT", total_w*10/100, LVCFMT_RIGHT as i32);
-                lv_insert_column(lv_wan, 5, "活动占比", total_w*16/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_wan, 0, "公网出口 IP", total_w*22/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 1, "命中服务", total_w*14/100, LVCFMT_CENTER as i32);
+                lv_insert_column(lv_wan, 2, "探测来源", total_w*64/100, LVCFMT_LEFT as i32);
             }
-            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多出口分布（按本地源 IP 分组） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
+            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 公网出口 IP（相同 IP 合并） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
 
             // Inner control for Log (created BEFORE grp_log)
             let edit_log = unsafe {
@@ -1794,7 +1785,7 @@ unsafe extern "system" fn wnd_proc(
             let mut ui = Box::new(UiState {
                 app, engine, theme,
                 cache: LabelCache::default(),
-                last_mode_active: None, log_gen: 0, log_seq: 0,
+                last_mode_active: None, log_gen: 0, log_seq: 0, wan_layout_rows: 1,
                 lbl_title, lbl_status, lbl_mem_badge,
                 grp_config, lbl_streams, edit_streams, lbl_max_conns, edit_max_conns, lbl_hold_secs, edit_hold_secs, chk_continuous,
                 lbl_tcp_targets, edit_tcp_targets, lbl_up_targets, edit_up_targets, lbl_down_targets, edit_down_targets,
@@ -1953,6 +1944,13 @@ unsafe extern "system" fn wnd_proc(
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
                 if !ptr.is_null() {
                     let ui = unsafe { &mut *ptr };
+                    let next_wan_rows = ui.app.stats.egress_ip_rows().len().max(1);
+                    if next_wan_rows != ui.wan_layout_rows {
+                        ui.wan_layout_rows = next_wan_rows;
+                        let mut client_rect = RECT::default();
+                        let _ = unsafe { GetClientRect(hwnd, &mut client_rect) };
+                        unsafe { ui.layout(client_rect.right - client_rect.left, client_rect.bottom - client_rect.top) };
+                    }
                     unsafe { ui.refresh_metrics_and_logs() };
                 }
             }
@@ -1997,7 +1995,7 @@ unsafe extern "system" fn wnd_proc(
                         let help_text = concat!(
                             "纯内存运行：测试配置、统计和日志仅保存在进程内存。\n\n",
                             "实时速率：按最近约 1 秒应用层字节增量计算。上传实时值是请求体交给 HTTP 客户端的速率，累计有效量只计完整请求返回 HTTP 2xx；下行按实际读取字节计算。\n\n",
-                            "多出口：按 TCP 连接实际本地源 IP 分组。同一 IP 合并显示；本地源 IP 不等同于路由器物理 WAN 口。\n\n",
+                            "多 WAN：并行查询多个公网 IP 服务，按返回的公网出口 IP 合并显示，列出命中的服务；支持 IPv4/IPv6。探测结果用于识别出口 IP，不代表物理 WAN 口或带宽占比。\n\n",
                             "仅对自己拥有或已获授权的目标进行连接和带宽测试。"
                         );
                         let wide = to_wide_null(help_text);
