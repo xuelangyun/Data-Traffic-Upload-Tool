@@ -1330,7 +1330,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         if stats.mode() == AppMode::DuplexTesting {
             let duplex_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
                 let xf = (i as f64) / 119.0;
-                let yf = ((pt.up_bps + pt.down_bps) as f64) / max_f).clamp(0.0,1.0);
+                let yf = ((pt.up_bps + pt.down_bps) as f64 / max_f).clamp(0.0, 1.0);
                 (xf, yf)
             }).collect();
             plot_series(mem_dc, duplex_pts, rgb(5, 122, 85), 2, PS_SOLID as u32);
