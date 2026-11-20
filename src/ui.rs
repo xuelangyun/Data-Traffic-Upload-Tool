@@ -17,16 +17,16 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     BN_CLICKED, BS_GROUPBOX, BS_PUSHBUTTON, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, EM_REPLACESEL, EM_SCROLLCARET,
-    EM_SETLIMITTEXT, EM_SETSEL, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_NUMBER,
-    ES_READONLY, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowTextLengthW,
-    GetWindowTextW, HMENU, IDC_ARROW, KillTimer, LoadCursorW, MB_ICONINFORMATION, MB_ICONWARNING,
-    MB_OK, MINMAXINFO, MSG, MessageBoxW, NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW,
-    SPI_GETNONCLIENTMETRICS, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    UpdateWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY,
-    WM_GETMINMAXINFO, WM_NCCREATE, WM_NCDESTROY, WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSEXW,
-    WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, ES_AUTOHSCROLL, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_NUMBER, ES_READONLY, GWLP_USERDATA, GetClientRect, GetMessageW,
+    GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW, HMENU, IDC_ARROW, KillTimer,
+    LoadCursorW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MINMAXINFO, MSG, MessageBoxW,
+    NONCLIENTMETRICSW, PostQuitMessage, RegisterClassExW, SPI_GETNONCLIENTMETRICS, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SendMessageW, SetTimer, SetWindowLongPtrW, SetWindowTextW,
+    ShowWindow, SystemParametersInfoW, TranslateMessage, UpdateWindow, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_GETMINMAXINFO, WM_NCCREATE, WM_NCDESTROY,
+    WM_SETFONT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_CHILD, WS_EX_CLIENTEDGE, WS_OVERLAPPEDWINDOW,
+    WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{PCWSTR, w};
 
@@ -38,6 +38,12 @@ use crate::state::{
 };
 
 const TIMER_REFRESH_ID: usize = 1;
+
+// Classic Win32 Edit control messages (WinUser.h ABI constants)
+const EM_SETSEL: u32 = 0x00B1;
+const EM_SCROLLCARET: u32 = 0x00B7;
+const EM_REPLACESEL: u32 = 0x00C2;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
 
 const ID_BTN_CONN: u16 = 1001;
 const ID_BTN_UP: u16 = 1002;

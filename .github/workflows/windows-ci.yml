@@ -29,7 +29,17 @@ jobs:
         run: cargo clippy --all-targets
 
       - name: Run unit tests
-        run: cargo test --all-targets
+        shell: pwsh
+        run: |
+          $out = cargo test --all-targets --message-format=short 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $out | Where-Object { $_ -match 'error' } | Select-Object -First 20 | ForEach-Object {
+              Write-Host "::error::$_"
+            }
+            exit $code
+          }
 
       - name: Build release binary
         shell: pwsh
