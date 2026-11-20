@@ -4,7 +4,6 @@
 //! pure in-memory state updates.
 
 use std::ffi::c_void;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -28,7 +27,6 @@ const ID_BTN_CLEAR_LOG: usize = 1007;
 const ID_BTN_HELP: usize = 1008;
 const ID_CHK_CONTINUOUS: usize = 1010;
 const ID_TIMER_REFRESH: usize = 2001;
-const MAX_EGRESS_IP_ROWS: usize = 8;
 const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
 // Classic Win32 Edit control messages omitted from windows crate UI bindings.
@@ -45,6 +43,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
 struct LabelCache {
     status: String,
     mem_badge: String,
+    // Legacy kept for log etc, but metrics now via table
     conn_row1: String,
     conn_row2: String,
     conn_row3: String,
@@ -57,7 +56,11 @@ struct LabelCache {
     rank_row: String,
     wan_ip: String,
     wan_header: String,
-    wan_rows: [String; MAX_EGRESS_IP_ROWS],
+    wan_rows: [String; 8],
+    // Table caches: keep last rendered cell to avoid flicker
+    metrics_cells: [[String; 6]; 8],
+    bandwidth_cells: [[String; 6]; 6],
+    wan_cells: [[String; 7]; 8],
 }
 
 struct SystemColors {
@@ -125,7 +128,6 @@ struct ThemeResources {
     font_bold: HFONT,
     font_log: HFONT,
     font_small: HFONT,
-    font_mono: HFONT,
     colors: SystemColors,
     brush_bg: HBRUSH,
     brush_card: HBRUSH,
@@ -136,9 +138,6 @@ impl ThemeResources {
         let safe_dpi = dpi.max(96);
         let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
-        let font_mono = unsafe {
-            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
-        };
         let colors = unsafe { SystemColors::query() };
         let brush_bg = unsafe { CreateSolidBrush(colors.bg) };
         let brush_card = unsafe { CreateSolidBrush(colors.card) };
@@ -152,7 +151,6 @@ impl ThemeResources {
             font_bold,
             font_log,
             font_small,
-            font_mono,
             colors,
             brush_bg,
             brush_card,
@@ -167,20 +165,15 @@ impl ThemeResources {
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
             delete_font(&mut self.font_small);
-            delete_font(&mut self.font_mono);
         }
         let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
-        let font_mono = unsafe {
-            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
-        };
         self.dpi = safe_dpi;
         self.font_title = font_title;
         self.font_ui = font_ui;
         self.font_bold = font_bold;
         self.font_log = font_log;
         self.font_small = font_small;
-        self.font_mono = font_mono;
         self.line_h = line_h;
         self.title_h = title_h;
     }
@@ -204,7 +197,6 @@ impl ThemeResources {
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
             delete_font(&mut self.font_small);
-            delete_font(&mut self.font_mono);
             if !self.brush_bg.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.brush_bg.0));
                 self.brush_bg = HBRUSH(std::ptr::null_mut());
@@ -510,31 +502,17 @@ struct UiState {
     btn_clear_log: HWND,
     btn_help: HWND,
 
-    // Live metrics group
+    // Table groups - ListView tables for aligned data
     grp_metrics: HWND,
-    lbl_conn_row1: HWND,
-    lbl_conn_row2: HWND,
-    lbl_conn_row3: HWND,
-    lbl_up_row: HWND,
-    lbl_up_detail: HWND,
-    lbl_down_row: HWND,
-    lbl_down_detail: HWND,
-
-    // Extended metrics
+    lv_metrics: HWND,
     grp_bandwidth: HWND,
-    lbl_duplex_row: HWND,
-    lbl_nic_row: HWND,
-    lbl_rank_row: HWND,
-
-    // WAN egress vertical table
+    lv_bandwidth: HWND,
     grp_wan: HWND,
+    lv_wan: HWND,
     lbl_wan_ip: HWND,
-    lbl_wan_header: HWND,
-    wan_rows: [HWND; MAX_EGRESS_IP_ROWS],
 
     // Chart (no child window clip - painted directly on parent)
     lbl_chart_title: HWND,
-    // grp_chart removed
 
     // Log group
     grp_log: HWND,
@@ -543,41 +521,6 @@ struct UiState {
 
 fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn parse_egress_ip_observations(raw: &str) -> Vec<(String, IpAddr)> {
-    raw.split('|')
-        .filter_map(|item| {
-            let (provider, address) = item.trim().split_once('=')?;
-            Some((provider.trim().to_string(), address.trim().parse::<IpAddr>().ok()?))
-        })
-        .collect()
-}
-
-fn build_wan_egress_rows(samples: &[(String, IpAddr)]) -> [String; MAX_EGRESS_IP_ROWS] {
-    let mut grouped: Vec<(IpAddr, Vec<&str>)> = Vec::new();
-    for (provider, address) in samples {
-        if let Some((_, providers)) = grouped.iter_mut().find(|(ip, _)| ip == address) {
-            providers.push(provider.as_str());
-        } else {
-            grouped.push((*address, vec![provider.as_str()]));
-        }
-    }
-    grouped.sort_by(|left, right| right.1.len().cmp(&left.1.len()));
-
-    std::array::from_fn(|index| {
-        let Some((address, providers)) = grouped.get(index) else {
-            return String::new();
-        };
-        let providers_text = providers.join(", ");
-        format!(
-            "{:<7} {:<39} {:>4}  {}",
-            format!("出口{}", index + 1),
-            address,
-            providers.len(),
-            providers_text
-        )
-    })
 }
 
 unsafe fn set_text(hwnd: HWND, text: &str) {
@@ -607,6 +550,89 @@ unsafe fn get_text(hwnd: HWND) -> String {
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
     let _ = unsafe { SendMessageW(hwnd, WM_SETFONT as u32, WPARAM(font.0 as usize), LPARAM(1)) };
+}
+
+unsafe fn create_listview(parent: HWND, hinst: HINSTANCE, font: HFONT) -> HWND {
+    let wide = to_wide_null("SysListView32");
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_CLIENTEDGE as u32,
+            PCWSTR(wide.as_ptr()),
+            PCWSTR(std::ptr::null()),
+            (WS_CHILD as u32 | WS_VISIBLE as u32 | WS_CLIPSIBLINGS as u32 | LVS_REPORT as u32 | LVS_SHOWSELALWAYS as u32 | LVS_SINGLESEL as u32) as u32,
+            0,0,10,10,
+            Some(parent),
+            None,
+            Some(hinst),
+            None,
+        )
+    };
+    if !hwnd.0.is_null() {
+        unsafe { set_font(hwnd, font) };
+        // Extended styles: gridlines + fullrowselect + doublebuffer (0x00010000)
+        let ex = (0x00000001u32 | 0x00000020u32 | 0x00010000u32 | 0x00000010u32) as usize; // gridlines|fullrowselect|doublebuffer|headerdragdrop
+        let _ = unsafe { SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE as u32, WPARAM(0), LPARAM(ex as isize)) };
+    }
+    hwnd
+}
+
+unsafe fn lv_insert_column(hwnd: HWND, idx: i32, title: &str, width: i32, fmt: i32) {
+    let mut wide = to_wide_null(title);
+    let mut col = LVCOLUMNW {
+        mask: (LVCF_TEXT | LVCF_WIDTH | LVCF_FMT) as u32,
+        fmt,
+        cx: width,
+        pszText: PWSTR(wide.as_mut_ptr()),
+        cchTextMax: 0,
+        iSubItem: 0,
+        iImage: 0,
+        iOrder: 0,
+        ..Default::default()
+    };
+    let _ = unsafe { SendMessageW(hwnd, LVM_INSERTCOLUMNW as u32, WPARAM(idx as usize), LPARAM(&mut col as *mut _ as isize)) };
+}
+
+unsafe fn lv_insert_row(hwnd: HWND, row: i32) {
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT as u32,
+        iItem: row,
+        iSubItem: 0,
+        state: 0,
+        stateMask: 0,
+        pszText: PWSTR(to_wide_null("").as_ptr() as *mut u16),
+        cchTextMax: 0,
+        iImage: 0,
+        lParam: LPARAM(0),
+        iIndent: 0,
+        iGroupId: 0,
+        cColumns: 0,
+        puColumns: std::ptr::null_mut(),
+        piColFmt: std::ptr::null_mut(),
+        iGroup: 0,
+    };
+    let _ = unsafe { SendMessageW(hwnd, LVM_INSERTITEMW as u32, WPARAM(0), LPARAM(&mut item as *mut _ as isize)) };
+}
+
+unsafe fn lv_set_cell(hwnd: HWND, row: i32, col: i32, text: &str) {
+    let mut wide = to_wide_null(text);
+    let mut item = LVITEMW {
+        mask: LVIF_TEXT as u32,
+        iItem: row,
+        iSubItem: col,
+        state: 0,
+        stateMask: 0,
+        pszText: PWSTR(wide.as_mut_ptr()),
+        cchTextMax: 0,
+        iImage: 0,
+        lParam: LPARAM(0),
+        iIndent: 0,
+        iGroupId: 0,
+        cColumns: 0,
+        puColumns: std::ptr::null_mut(),
+        piColFmt: std::ptr::null_mut(),
+        iGroup: 0,
+    };
+    let _ = unsafe { SendMessageW(hwnd, LVM_SETITEMTEXTW as u32, WPARAM(row as usize), LPARAM(&mut item as *mut _ as isize)) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,25 +711,12 @@ impl UiState {
             set_font(self.btn_help, t.font_ui);
 
             set_font(self.grp_metrics, t.font_bold);
-            set_font(self.lbl_conn_row1, t.font_bold);
-            set_font(self.lbl_conn_row2, t.font_small);
-            set_font(self.lbl_conn_row3, t.font_small);
-            set_font(self.lbl_up_row, t.font_ui);
-            set_font(self.lbl_up_detail, t.font_small);
-            set_font(self.lbl_down_row, t.font_ui);
-            set_font(self.lbl_down_detail, t.font_small);
-
+            set_font(self.lv_metrics, t.font_small);
             set_font(self.grp_bandwidth, t.font_bold);
-            set_font(self.lbl_duplex_row, t.font_bold);
-            set_font(self.lbl_nic_row, t.font_small);
-            set_font(self.lbl_rank_row, t.font_small);
-
+            set_font(self.lv_bandwidth, t.font_small);
             set_font(self.grp_wan, t.font_bold);
             set_font(self.lbl_wan_ip, t.font_small);
-            set_font(self.lbl_wan_header, t.font_mono);
-            for &hw in &self.wan_rows {
-                set_font(hw, t.font_mono);
-            }
+            set_font(self.lv_wan, t.font_small);
             set_font(self.lbl_chart_title, t.font_bold);
             set_font(self.grp_log, t.font_bold);
             set_font(self.edit_log, t.font_log);
@@ -715,275 +728,111 @@ impl UiState {
         let s = |px: i32| scale_px(px, dpi);
         let lh = self.theme.line_h;
         let th = self.theme.title_h;
-
-        // Compact margins
         let margin = s(8);
         let inner_pad = s(8);
         let gap = s(6);
         let row_gap = s(4);
         let w = (width - margin * 2).max(s(860));
-
         let row_h = lh + s(4);
         let small_row_h = lh + s(2);
         let edit_h = lh + s(4);
         let multi_edit_h = lh * 2 + s(8);
         let btn_h = lh + s(8);
-
         let mut hdwp = unsafe { BeginDeferWindowPos(64) };
         let defer = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
             if !hdwp.0.is_null() {
-                *hdwp = unsafe {
-                    DeferWindowPos(
-                        *hdwp,
-                        hwnd,
-                        None,
-                        x,
-                        y,
-                        cx.max(1),
-                        cy.max(1),
-                        (SWP_NOZORDER | SWP_NOACTIVATE) as u32,
-                    )
-                };
-            } else {
-                let _ = unsafe { MoveWindow(hwnd, x, y, cx.max(1), cy.max(1), true) };
-            }
+                *hdwp = unsafe { DeferWindowPos(*hdwp, hwnd, None, x, y, cx.max(1), cy.max(1), (SWP_NOZORDER | SWP_NOACTIVATE) as u32) };
+            } else { let _ = unsafe { MoveWindow(hwnd, x, y, cx.max(1), cy.max(1), true) }; }
         };
         let defer_bottom = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
             if !hdwp.0.is_null() {
-                *hdwp = unsafe {
-                    DeferWindowPos(
-                        *hdwp,
-                        hwnd,
-                        Some(HWND_BOTTOM),
-                        x,
-                        y,
-                        cx.max(1),
-                        cy.max(1),
-                        SWP_NOACTIVATE as u32,
-                    )
-                };
-            } else {
-                let _ = unsafe {
-                    SetWindowPos(
-                        hwnd,
-                        Some(HWND_BOTTOM),
-                        x,
-                        y,
-                        cx.max(1),
-                        cy.max(1),
-                        SWP_NOACTIVATE as u32,
-                    )
-                };
-            }
+                *hdwp = unsafe { DeferWindowPos(*hdwp, hwnd, Some(HWND_BOTTOM), x, y, cx.max(1), cy.max(1), SWP_NOACTIVATE as u32) };
+            } else { let _ = unsafe { SetWindowPos(hwnd, Some(HWND_BOTTOM), x, y, cx.max(1), cy.max(1), SWP_NOACTIVATE as u32) }; }
         };
-
         let mut y = s(6);
-
-        // Top header bar - compact
         let title_w = (w * 50) / 100;
         let status_w = w - title_w - gap;
         let title_row_h = th + s(4);
         defer(&mut hdwp, self.lbl_title, margin, y, title_w, title_row_h);
-        defer(
-            &mut hdwp,
-            self.lbl_status,
-            margin + title_w + gap,
-            y + s(1),
-            status_w,
-            title_row_h - s(1),
-        );
+        defer(&mut hdwp, self.lbl_status, margin + title_w + gap, y + s(1), status_w, title_row_h - s(1));
         y += title_row_h + s(1);
-
         defer(&mut hdwp, self.lbl_mem_badge, margin, y, w, lh + s(2));
         y += lh + s(6);
-
-        // Group 1: Config
+        // Config
         let cfg_top = y;
         let cfg_title_offset = lh + s(6);
         let cfg_inner_w = w - inner_pad * 2;
         let cfg_x = margin + inner_pad;
         let mut cy = cfg_top + cfg_title_offset;
-
-        let lbl_s_w = s(124);
-        let edt_s_w = s(52);
-        let lbl_m_w = s(142);
-        let edt_m_w = s(64);
-        let lbl_h_w = s(92);
-        let edt_h_w = s(42);
-
+        let lbl_s_w = s(124); let edt_s_w = s(52); let lbl_m_w = s(142); let edt_m_w = s(64); let lbl_h_w = s(92); let edt_h_w = s(42);
         let mut rx = cfg_x;
-        defer(&mut hdwp, self.lbl_streams, rx, cy, lbl_s_w, edit_h);
-        rx += lbl_s_w + s(3);
-        defer(&mut hdwp, self.edit_streams, rx, cy, edt_s_w, edit_h);
-        rx += edt_s_w + s(8);
-
-        defer(&mut hdwp, self.lbl_max_conns, rx, cy, lbl_m_w, edit_h);
-        rx += lbl_m_w + s(3);
-        defer(&mut hdwp, self.edit_max_conns, rx, cy, edt_m_w, edit_h);
-        rx += edt_m_w + s(8);
-
-        defer(&mut hdwp, self.lbl_hold_secs, rx, cy, lbl_h_w, edit_h);
-        rx += lbl_h_w + s(3);
-        defer(&mut hdwp, self.edit_hold_secs, rx, cy, edt_h_w, edit_h);
-        rx += edt_h_w + s(8);
-
+        defer(&mut hdwp, self.lbl_streams, rx, cy, lbl_s_w, edit_h); rx += lbl_s_w + s(3);
+        defer(&mut hdwp, self.edit_streams, rx, cy, edt_s_w, edit_h); rx += edt_s_w + s(8);
+        defer(&mut hdwp, self.lbl_max_conns, rx, cy, lbl_m_w, edit_h); rx += lbl_m_w + s(3);
+        defer(&mut hdwp, self.edit_max_conns, rx, cy, edt_m_w, edit_h); rx += edt_m_w + s(8);
+        defer(&mut hdwp, self.lbl_hold_secs, rx, cy, lbl_h_w, edit_h); rx += lbl_h_w + s(3);
+        defer(&mut hdwp, self.edit_hold_secs, rx, cy, edt_h_w, edit_h); rx += edt_h_w + s(8);
         let chk_w = (cfg_x + cfg_inner_w - rx).max(s(132));
         defer(&mut hdwp, self.chk_continuous, rx, cy, chk_w, edit_h);
         cy += edit_h + row_gap;
-
-        let target_lbl_w = s(176);
-        let target_edt_w = (cfg_inner_w - target_lbl_w - gap).max(s(220));
-        let target_edt_x = cfg_x + target_lbl_w + gap;
-
+        let target_lbl_w = s(176); let target_edt_w = (cfg_inner_w - target_lbl_w - gap).max(s(220)); let target_edt_x = cfg_x + target_lbl_w + gap;
         defer(&mut hdwp, self.lbl_tcp_targets, cfg_x, cy, target_lbl_w, edit_h);
-        defer(
-            &mut hdwp,
-            self.edit_tcp_targets,
-            target_edt_x,
-            cy,
-            target_edt_w,
-            edit_h,
-        );
-        cy += edit_h + row_gap;
-
+        defer(&mut hdwp, self.edit_tcp_targets, target_edt_x, cy, target_edt_w, edit_h); cy += edit_h + row_gap;
         defer(&mut hdwp, self.lbl_up_targets, cfg_x, cy, target_lbl_w, edit_h);
-        defer(
-            &mut hdwp,
-            self.edit_up_targets,
-            target_edt_x,
-            cy,
-            target_edt_w,
-            edit_h,
-        );
-        cy += edit_h + row_gap;
-
-        defer(
-            &mut hdwp,
-            self.lbl_down_targets,
-            cfg_x,
-            cy,
-            target_lbl_w,
-            edit_h,
-        );
-        defer(
-            &mut hdwp,
-            self.edit_down_targets,
-            target_edt_x,
-            cy,
-            target_edt_w,
-            multi_edit_h,
-        );
-        cy += multi_edit_h + s(8);
-
+        defer(&mut hdwp, self.edit_up_targets, target_edt_x, cy, target_edt_w, edit_h); cy += edit_h + row_gap;
+        defer(&mut hdwp, self.lbl_down_targets, cfg_x, cy, target_lbl_w, edit_h);
+        defer(&mut hdwp, self.edit_down_targets, target_edt_x, cy, target_edt_w, multi_edit_h); cy += multi_edit_h + s(8);
         let cfg_h = cy - cfg_top;
         defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
         y = cfg_top + cfg_h + s(6);
-
-        // Action buttons row (8 buttons)
-        let b_gap = s(4);
-        let avail = w - b_gap * 7;
-        let weights = [118, 118, 118, 128, 112, 82, 82, 82];
-        let total_w: i32 = weights.iter().sum();
-        let btns = [
-            self.btn_conn,
-            self.btn_up,
-            self.btn_down,
-            self.btn_duplex,
-            self.btn_stop,
-            self.btn_reset,
-            self.btn_clear_log,
-            self.btn_help,
-        ];
+        // Buttons
+        let b_gap = s(4); let avail = w - b_gap * 7; let weights = [118,118,118,128,112,82,82,82]; let total_w: i32 = weights.iter().sum();
+        let btns = [self.btn_conn,self.btn_up,self.btn_down,self.btn_duplex,self.btn_stop,self.btn_reset,self.btn_clear_log,self.btn_help];
         let mut bx = margin;
         for (i, &btn) in btns.iter().enumerate() {
-            let bw = if i == btns.len() - 1 {
-                margin + w - bx
-            } else {
-                (avail * weights[i]) / total_w
-            };
-            defer(&mut hdwp, btn, bx, y, bw, btn_h);
-            bx += bw + b_gap;
+            let bw = if i==btns.len()-1 { margin + w - bx } else { (avail*weights[i])/total_w };
+            defer(&mut hdwp, btn, bx, y, bw, btn_h); bx += bw + b_gap;
         }
         y += btn_h + s(6);
-
-        // Group 2: Metrics (5 rows: conn1,2,3, up, down)
-        let met_top = y;
-        let met_h = cfg_title_offset + row_h + small_row_h * 2 + row_h * 2 + s(6);
-        defer_bottom(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
-
-        let mut my = met_top + cfg_title_offset;
-        defer(&mut hdwp, self.lbl_conn_row1, cfg_x, my, cfg_inner_w, row_h);
-        my += row_h;
-        defer(&mut hdwp, self.lbl_conn_row2, cfg_x, my, cfg_inner_w, small_row_h);
-        my += small_row_h;
-        defer(&mut hdwp, self.lbl_conn_row3, cfg_x, my, cfg_inner_w, small_row_h);
-        my += small_row_h;
-        defer(&mut hdwp, self.lbl_up_row, cfg_x, my, cfg_inner_w, row_h);
-        my += row_h;
-        defer(&mut hdwp, self.lbl_down_row, cfg_x, my, cfg_inner_w, row_h);
-        y = met_top + met_h + s(6);
-
-        // Group 3: Bandwidth detail (5 rows)
-        let det_top = y;
-        let det_h = cfg_title_offset + row_h + small_row_h * 4 + s(6);
-        defer_bottom(&mut hdwp, self.grp_bandwidth, margin, det_top, w, det_h);
-        let mut dy = det_top + cfg_title_offset;
-        defer(&mut hdwp, self.lbl_up_detail, cfg_x, dy, cfg_inner_w, small_row_h);
-        dy += small_row_h;
-        defer(&mut hdwp, self.lbl_down_detail, cfg_x, dy, cfg_inner_w, small_row_h);
-        dy += small_row_h;
-        defer(&mut hdwp, self.lbl_duplex_row, cfg_x, dy, cfg_inner_w, row_h);
-        dy += row_h;
-        defer(&mut hdwp, self.lbl_nic_row, cfg_x, dy, cfg_inner_w, small_row_h);
-        dy += small_row_h;
-        defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
-        y = det_top + det_h + s(6);
-
-        // Group 4: detected WAN egress public IP table (fixed-width rows)
+        // Metrics table: 8 rows incl header? Actually ListView header counts, so inner height = header + rows*row_h
+        let metrics_top = y;
+        let metrics_title_off = lh + s(6);
+        let metrics_rows = 7; // 7 data rows
+        let metrics_h = metrics_title_off + s(22) + metrics_rows * small_row_h + s(8);
+        // s(22) approx header height
+        defer_bottom(&mut hdwp, self.grp_metrics, margin, metrics_top, w, metrics_h);
+        defer(&mut hdwp, self.lv_metrics, cfg_x, metrics_top + metrics_title_off, cfg_inner_w, metrics_h - metrics_title_off - s(4));
+        y = metrics_top + metrics_h + s(6);
+        // Bandwidth table: 5 rows
+        let bw_top = y;
+        let bw_rows = 5;
+        let bw_h = metrics_title_off + s(22) + bw_rows * small_row_h + s(8);
+        defer_bottom(&mut hdwp, self.grp_bandwidth, margin, bw_top, w, bw_h);
+        defer(&mut hdwp, self.lv_bandwidth, cfg_x, bw_top + metrics_title_off, cfg_inner_w, bw_h - metrics_title_off - s(4));
+        y = bw_top + bw_h + s(6);
+        // WAN table: header + up to 8 rows
         let wan_top = y;
-        let wan_title_offset = lh + s(6);
-        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_EGRESS_IP_ROWS as i32) + s(6);
-        defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, target_table_height);
-        let mut wy = wan_top + wan_title_offset;
-        defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wy, cfg_inner_w, small_row_h);
-        wy += small_row_h;
-        defer(&mut hdwp, self.lbl_wan_header, cfg_x, wy, cfg_inner_w, small_row_h);
-        wy += small_row_h;
-        for i in 0..MAX_EGRESS_IP_ROWS {
-            defer(&mut hdwp, self.wan_rows[i], cfg_x, wy, cfg_inner_w, small_row_h);
-            wy += small_row_h;
-        }
-        y = wan_top + target_table_height + s(6);
-
-        // Chart title label + rect (painted directly on parent, no child window)
+        let wan_rows = 8;
+        let wan_h = metrics_title_off + small_row_h + s(22) + wan_rows * small_row_h + s(8);
+        defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h);
+        // Inside WAN: lbl_wan_ip small row at top of inner area, then ListView occupies rest
+        let wan_inner_y = wan_top + metrics_title_off;
+        defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wan_inner_y, cfg_inner_w, small_row_h);
+        defer(&mut hdwp, self.lv_wan, cfg_x, wan_inner_y + small_row_h + s(2), cfg_inner_w, wan_h - metrics_title_off - small_row_h - s(6));
+        y = wan_top + wan_h + s(6);
+        // Chart
         let chart_title_h = lh + s(4);
         defer(&mut hdwp, self.lbl_chart_title, margin, y, w, chart_title_h);
         y += chart_title_h + s(4);
         let chart_h = s(130).max(lh * 7 + s(12));
-        self.chart_rect = RECT {
-            left: margin + s(2),
-            top: y,
-            right: margin + w - s(2),
-            bottom: y + chart_h,
-        };
+        self.chart_rect = RECT { left: margin + s(2), top: y, right: margin + w - s(2), bottom: y + chart_h };
         y = y + chart_h + s(6);
-
-        // Group 5: Log - fill remaining
+        // Log
         let log_top = y;
         let log_h = (height - log_top - s(6)).max(s(90));
         defer_bottom(&mut hdwp, self.grp_log, margin, log_top, w, log_h);
-        defer(
-            &mut hdwp,
-            self.edit_log,
-            cfg_x,
-            log_top + cfg_title_offset,
-            cfg_inner_w,
-            (log_h - cfg_title_offset - s(6)).max(s(60)),
-        );
-
-        if !hdwp.0.is_null() {
-            let _ = unsafe { EndDeferWindowPos(hdwp) };
-        }
+        defer(&mut hdwp, self.edit_log, cfg_x, log_top + metrics_title_off, cfg_inner_w, (log_h - metrics_title_off - s(6)).max(s(60)));
+        if !hdwp.0.is_null() { let _ = unsafe { EndDeferWindowPos(hdwp) }; }
     }
 
     unsafe fn reset_defaults(&self) {
@@ -1081,6 +930,8 @@ impl UiState {
         );
         unsafe { set_cached_text(self.lbl_mem_badge, &mut self.cache.mem_badge, mem_badge) };
 
+        // === Table-based async-safe refresh with data alignment ===
+        // Gather stats once to avoid jitter from racy reads
         let c_cur = stats.conn_current.load(Ordering::Relaxed);
         let c_tgt = stats.conn_target_probe.load(Ordering::Relaxed);
         let c_peak = stats.conn_peak.load(Ordering::Relaxed);
@@ -1093,32 +944,14 @@ impl UiState {
         let orig_ok = stats.conn_orig_success.load(Ordering::Relaxed);
         let orig_att = stats.conn_orig_attempts.load(Ordering::Relaxed);
         let orig_pct = stats.orig_success_rate_pct();
-
-        let conn_row1 = format!(
-            "[分级结果] 瞬时峰值: {c_peak} (建连峰值 {cps_peak}/s, 原始成功率 {orig_pct:.1}%)  |  稳定并发: {c_stable}  |  长时间保持: {c_hold} (持续 {hold_secs}s)"
-        );
-        unsafe { set_cached_text(self.lbl_conn_row1, &mut self.cache.conn_row1, conn_row1) };
-
         let rep_ok = stats.conn_replenish_success.load(Ordering::Relaxed);
         let rep_att = stats.conn_replenish_attempts.load(Ordering::Relaxed);
         let f_loc = stats.conn_fail_local.load(Ordering::Relaxed);
         let f_ref = stats.conn_fail_refused.load(Ordering::Relaxed);
         let f_rem = stats.conn_remote_closed.load(Ordering::Relaxed);
         let f_to = stats.conn_fail_timeout.load(Ordering::Relaxed);
-        let conn_row2 = format!(
-            "[连接归属] 存活: {c_cur} (目标:{c_tgt})  |  原始: {orig_ok}/{orig_att}  |  补建(不计入原始): {rep_ok}/{rep_att}  |  本机:{f_loc}  远拒:{f_ref}  远闭:{f_rem}  超时:{f_to}"
-        );
-        unsafe { set_cached_text(self.lbl_conn_row2, &mut self.cache.conn_row2, conn_row2) };
-
         let t_healthy = stats.conn_targets_healthy.load(Ordering::Relaxed);
         let t_total = stats.conn_targets_total.load(Ordering::Relaxed);
-        let wan_summary = stats.target_distribution_summary();
-        let conn_row3 = format!(
-            "[远端目标分布] 健康目标: {t_healthy}/{t_total}  |  建连速率: {c_cps}/s  |  RTT: {c_rtt} ms  |  当前存活连接占比: {wan_summary}"
-        );
-        unsafe { set_cached_text(self.lbl_conn_row3, &mut self.cache.conn_row3, conn_row3) };
-
-        // Upload realtime
         let up_bps = stats.up_bps_current.load(Ordering::Relaxed);
         let up_peak = stats.up_bps_peak.load(Ordering::Relaxed);
         let up_avg = stats.up_bps_avg.load(Ordering::Relaxed);
@@ -1130,23 +963,6 @@ impl UiState {
         let up_err = stats.up_errors.load(Ordering::Relaxed);
         let up_fail = stats.up_fail_rate_pct();
         let up_lat = stats.up_latency_ms.load(Ordering::Relaxed);
-        let up_row = format!(
-            "[上行] 实时:{} 峰值:{} 平均:{} P95:{} | 并发:{up_cur_c}(最佳{up_best_c}) 活跃流:{up_streams} 失败率:{up_fail:.1}% 错误:{up_err}",
-            format_mbps(up_bps),
-            format_mbps(up_peak),
-            format_mbps(up_avg),
-            format_mbps(up_p95),
-        );
-        unsafe { set_cached_text(self.lbl_up_row, &mut self.cache.up_row, up_row) };
-
-        let up_detail = format!(
-            "  └ HTTP 2xx 接受量:{} | 延迟:{up_lat}ms | 系统 IPv4 TCP 重传率:{retrans_pct:.2}% | 物理网卡上行:{}",
-            format_bytes(up_total),
-            format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
-        );
-        unsafe { set_cached_text(self.lbl_up_detail, &mut self.cache.up_detail, up_detail) };
-
-        // Download realtime
         let down_bps = stats.down_bps_current.load(Ordering::Relaxed);
         let down_peak = stats.down_bps_peak.load(Ordering::Relaxed);
         let down_avg = stats.down_bps_avg.load(Ordering::Relaxed);
@@ -1160,106 +976,167 @@ impl UiState {
         let tcp_ms = stats.down_tcp_ms.load(Ordering::Relaxed);
         let tls_ms = stats.down_tls_ms.load(Ordering::Relaxed);
         let ttfb_ms = stats.down_ttfb_ms.load(Ordering::Relaxed);
-        let down_row = format!(
-            "[下行] 实时:{} 峰值:{} 平均:{} P95:{} | 并发:{down_cur_c}(最佳{down_best_c}) 活跃流:{down_streams} 失败率:{down_fail:.1}% 错误:{down_err}",
-            format_mbps(down_bps),
-            format_mbps(down_peak),
-            format_mbps(down_avg),
-            format_mbps(down_p95),
-        );
-        unsafe { set_cached_text(self.lbl_down_row, &mut self.cache.down_row, down_row) };
-
-        let down_detail = format!(
-            "  └ 累计接收:{} | TCP:{tcp_ms}ms TLS:{tls_ms}ms TTFB:{ttfb_ms}ms | NIC下行:{}",
-            format_bytes(down_total),
-            format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
-        );
-        unsafe {
-            set_cached_text(
-                self.lbl_down_detail,
-                &mut self.cache.down_detail,
-                down_detail,
-            )
-        };
-
-        // Duplex combined
-        let duplex_text = if mode == AppMode::DuplexTesting {
-            let combined = up_bps + down_bps;
-            let combined_avg = stats.up_bps_avg.load(Ordering::Relaxed)
-                + stats.down_bps_avg.load(Ordering::Relaxed);
-            format!(
-                "[双向] 实时合计:{} (上{}+下{}) | 有效平均合计:{} | 应用↔网卡对比: 上行网卡{} 下行网卡{}",
-                format_mbps(combined),
-                format_mbps(up_bps),
-                format_mbps(down_bps),
-                format_mbps(combined_avg),
-                format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
-                format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
-            )
-        } else {
-            format!(
-                "[双向] 空闲 — 点击“双向同时压测”可同时跑满上行+下行 | 合计峰值: {}",
-                format_mbps(up_peak + down_peak)
-            )
-        };
-        unsafe { set_cached_text(self.lbl_duplex_row, &mut self.cache.duplex_row, duplex_text) };
-
-        // NIC
         let nic_tx = stats.nic_tx_total.load(Ordering::Relaxed);
         let nic_rx = stats.nic_rx_total.load(Ordering::Relaxed);
+        let nic_up = stats.nic_up_bps.load(Ordering::Relaxed);
+        let nic_down = stats.nic_down_bps.load(Ordering::Relaxed);
         let nic_summary = stats.nic_summary.lock().clone();
-        let nic_row = format!(
-            "[网卡] 实时上行:{} 下行:{} | 累计发送:{} 接收:{} | 网卡:{}",
-            format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
-            format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
-            format_bytes(nic_tx),
-            format_bytes(nic_rx),
-            if nic_summary.is_empty() {
-                "检测中..."
-            } else {
-                &nic_summary
-            }
-        );
-        unsafe { set_cached_text(self.lbl_nic_row, &mut self.cache.nic_row, nic_row) };
-
-        // Node ranking
         let up_rank = crate::state::SharedStats::node_ranking_summary(&stats.up_node_metrics);
         let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
-        let rank_text = format!("[节点排名] 上行: {up_rank}  |  下行: {down_rank}");
-        unsafe { set_cached_text(self.lbl_rank_row, &mut self.cache.rank_row, rank_text) };
+        let egress_ips = crate::sys_stats::query_egress_local_ips();
+        let wan_ip_raw = stats.wan_public_ip.lock().clone();
 
-        // Independent public-IP observations by destination; not a WAN1/WAN2 mapping.
-        let egress_ip_raw = stats.egress_ip_observations.lock().clone();
-        let egress_ip_age = {
-            let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
-            if last==0 { "".to_string() } else {
-                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                let secs = now_ms.saturating_sub(last)/1000;
-                if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
+        // Helper to update ListView cell with cache check (prevent jitter)
+        let mut set_lv_cell = |hwnd: HWND, row: i32, col: i32, cache: &mut String, next: String| {
+            if *cache != next {
+                unsafe { lv_set_cell(hwnd, row, col, &next) };
+                *cache = next;
             }
         };
-        let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
-        let wan_rows = build_wan_egress_rows(&wan_samples);
-        let unique_exit_count = wan_rows.iter().filter(|row| !row.is_empty()).count();
-        let egress_ip_text = format!(
-            "公网出口探测{} | 本轮检测到 {} 个不同的出口公网 IP",
-            egress_ip_age,
-            unique_exit_count
-        );
-        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
-
-        let wan_header_text = format!(
-            "{:<7} {:<39} {:>4}  {}",
-            "出口", "公网出口 IP", "命中", "探测来源"
-        );
-        unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
-
-        for idx in 0..MAX_EGRESS_IP_ROWS {
-            let next = wan_rows[idx].clone();
-            let hwnd = self.wan_rows[idx];
-            unsafe { set_cached_text(hwnd, &mut self.cache.wan_rows[idx], next) };
-            let show = !self.cache.wan_rows[idx].is_empty();
-            let _ = unsafe { ShowWindow(hwnd, if show { SW_SHOW } else { SW_HIDE }) };
+        // Metrics table: 7 rows, 6 cols
+        // Row mapping:
+        // 0: 分级 瞬时峰值
+        // 1: 分级 稳定并发
+        // 2: 分级 长时保持
+        // 3: 归属 存活
+        // 4: 归属 原始
+        // 5: 上行 实时
+        // 6: 下行 实时
+        {
+            let lv = self.lv_metrics;
+            // Freeze updates to prevent flicker
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
+            // Row 0
+            set_lv_cell(lv, 0, 0, &mut self.cache.metrics_cells[0][0], "分级".to_string());
+            set_lv_cell(lv, 0, 1, &mut self.cache.metrics_cells[0][1], "瞬时峰值".to_string());
+            set_lv_cell(lv, 0, 2, &mut self.cache.metrics_cells[0][2], format!("{c_peak}"));
+            set_lv_cell(lv, 0, 3, &mut self.cache.metrics_cells[0][3], format!("{cps_peak}/s"));
+            set_lv_cell(lv, 0, 4, &mut self.cache.metrics_cells[0][4], format!("{orig_pct:.1}%"));
+            set_lv_cell(lv, 0, 5, &mut self.cache.metrics_cells[0][5], format!("建连峰值{:.1}%", orig_pct));
+            // Row1
+            set_lv_cell(lv, 1, 0, &mut self.cache.metrics_cells[1][0], "分级".to_string());
+            set_lv_cell(lv, 1, 1, &mut self.cache.metrics_cells[1][1], "稳定并发".to_string());
+            set_lv_cell(lv, 1, 2, &mut self.cache.metrics_cells[1][2], format!("{c_stable}"));
+            set_lv_cell(lv, 1, 3, &mut self.cache.metrics_cells[1][3], "-".to_string());
+            set_lv_cell(lv, 1, 4, &mut self.cache.metrics_cells[1][4], "-".to_string());
+            set_lv_cell(lv, 1, 5, &mut self.cache.metrics_cells[1][5], format!("达标上限 {}", c_stable));
+            // Row2
+            set_lv_cell(lv, 2, 0, &mut self.cache.metrics_cells[2][0], "分级".to_string());
+            set_lv_cell(lv, 2, 1, &mut self.cache.metrics_cells[2][1], "长时保持".to_string());
+            set_lv_cell(lv, 2, 2, &mut self.cache.metrics_cells[2][2], format!("{c_hold}"));
+            set_lv_cell(lv, 2, 3, &mut self.cache.metrics_cells[2][3], format!("持续{hold_secs}s"));
+            set_lv_cell(lv, 2, 4, &mut self.cache.metrics_cells[2][4], if holding { "保持中" } else { "-" }.to_string());
+            set_lv_cell(lv, 2, 5, &mut self.cache.metrics_cells[2][5], format!("保持均值{c_hold}"));
+            // Row3
+            set_lv_cell(lv, 3, 0, &mut self.cache.metrics_cells[3][0], "归属".to_string());
+            set_lv_cell(lv, 3, 1, &mut self.cache.metrics_cells[3][1], "存活/目标".to_string());
+            set_lv_cell(lv, 3, 2, &mut self.cache.metrics_cells[3][2], format!("{c_cur}"));
+            set_lv_cell(lv, 3, 3, &mut self.cache.metrics_cells[3][3], format!("{c_tgt}"));
+            set_lv_cell(lv, 3, 4, &mut self.cache.metrics_cells[3][4], format!("{c_cps}/s"));
+            set_lv_cell(lv, 3, 5, &mut self.cache.metrics_cells[3][5], format!("健康{t_healthy}/{t_total} RTT{c_rtt}ms"));
+            // Row4
+            set_lv_cell(lv, 4, 0, &mut self.cache.metrics_cells[4][0], "归属".to_string());
+            set_lv_cell(lv, 4, 1, &mut self.cache.metrics_cells[4][1], "原始成功".to_string());
+            set_lv_cell(lv, 4, 2, &mut self.cache.metrics_cells[4][2], format!("{orig_ok}"));
+            set_lv_cell(lv, 4, 3, &mut self.cache.metrics_cells[4][3], format!("{orig_att}"));
+            set_lv_cell(lv, 4, 4, &mut self.cache.metrics_cells[4][4], format!("{orig_pct:.1}%"));
+            set_lv_cell(lv, 4, 5, &mut self.cache.metrics_cells[4][5], format!("补建{rep_ok}/{rep_att} 失败本机{f_loc} 远拒{f_ref} 远闭{f_rem} 超时{f_to}"));
+            // Row5 上行
+            set_lv_cell(lv, 5, 0, &mut self.cache.metrics_cells[5][0], "上行".to_string());
+            set_lv_cell(lv, 5, 1, &mut self.cache.metrics_cells[5][1], "实时".to_string());
+            set_lv_cell(lv, 5, 2, &mut self.cache.metrics_cells[5][2], format_mbps(up_bps));
+            set_lv_cell(lv, 5, 3, &mut self.cache.metrics_cells[5][3], format_mbps(up_peak));
+            set_lv_cell(lv, 5, 4, &mut self.cache.metrics_cells[5][4], format!("{up_fail:.1}%/{}err", up_err));
+            set_lv_cell(lv, 5, 5, &mut self.cache.metrics_cells[5][5], format!("并发{up_cur_c}(最佳{up_best_c}) 流{up_streams} 平均{} P95{}", format_mbps(up_avg), format_mbps(up_p95)));
+            // Row6 下行
+            set_lv_cell(lv, 6, 0, &mut self.cache.metrics_cells[6][0], "下行".to_string());
+            set_lv_cell(lv, 6, 1, &mut self.cache.metrics_cells[6][1], "实时".to_string());
+            set_lv_cell(lv, 6, 2, &mut self.cache.metrics_cells[6][2], format_mbps(down_bps));
+            set_lv_cell(lv, 6, 3, &mut self.cache.metrics_cells[6][3], format_mbps(down_peak));
+            set_lv_cell(lv, 6, 4, &mut self.cache.metrics_cells[6][4], format!("{down_fail:.1}%/{}err", down_err));
+            set_lv_cell(lv, 6, 5, &mut self.cache.metrics_cells[6][5], format!("并发{down_cur_c}(最佳{down_best_c}) 流{down_streams} 平均{} P95{}", format_mbps(down_avg), format_mbps(down_p95)));
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
+        }
+        // Bandwidth table: 5 rows, 6 cols
+        {
+            let lv = self.lv_bandwidth;
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
+            // Row0 上行详情
+            set_lv_cell(lv, 0, 0, &mut self.cache.bandwidth_cells[0][0], "上行".to_string());
+            set_lv_cell(lv, 0, 1, &mut self.cache.bandwidth_cells[0][1], format_mbps(up_bps));
+            set_lv_cell(lv, 0, 2, &mut self.cache.bandwidth_cells[0][2], format_mbps(up_peak));
+            set_lv_cell(lv, 0, 3, &mut self.cache.bandwidth_cells[0][3], format!("{} P95:{}", format_mbps(up_avg), format_mbps(up_p95)));
+            set_lv_cell(lv, 0, 4, &mut self.cache.bandwidth_cells[0][4], format_bytes(up_total));
+            set_lv_cell(lv, 0, 5, &mut self.cache.bandwidth_cells[0][5], format!("延迟{up_lat}ms 重传{retrans_pct:.2}% NIC{}", format_mbps(nic_up)));
+            // Row1 下行详情
+            set_lv_cell(lv, 1, 0, &mut self.cache.bandwidth_cells[1][0], "下行".to_string());
+            set_lv_cell(lv, 1, 1, &mut self.cache.bandwidth_cells[1][1], format_mbps(down_bps));
+            set_lv_cell(lv, 1, 2, &mut self.cache.bandwidth_cells[1][2], format_mbps(down_peak));
+            set_lv_cell(lv, 1, 3, &mut self.cache.bandwidth_cells[1][3], format!("{} P95:{}", format_mbps(down_avg), format_mbps(down_p95)));
+            set_lv_cell(lv, 1, 4, &mut self.cache.bandwidth_cells[1][4], format_bytes(down_total));
+            set_lv_cell(lv, 1, 5, &mut self.cache.bandwidth_cells[1][5], format!("TCP{tcp_ms} TLS{tls_ms} TTFB{ttfb_ms} NIC{}", format_mbps(nic_down)));
+            // Row2 双向
+            let duplex_val = if mode==AppMode::DuplexTesting { format_mbps(up_bps+down_bps) } else { "-".to_string() };
+            let duplex_peak = format_mbps(up_peak+down_peak);
+            set_lv_cell(lv, 2, 0, &mut self.cache.bandwidth_cells[2][0], "双向".to_string());
+            set_lv_cell(lv, 2, 1, &mut self.cache.bandwidth_cells[2][1], duplex_val);
+            set_lv_cell(lv, 2, 2, &mut self.cache.bandwidth_cells[2][2], duplex_peak);
+            set_lv_cell(lv, 2, 3, &mut self.cache.bandwidth_cells[2][3], format_mbps(up_avg+down_avg));
+            set_lv_cell(lv, 2, 4, &mut self.cache.bandwidth_cells[2][4], format!("上{} 下{}", format_mbps(nic_up), format_mbps(nic_down)));
+            set_lv_cell(lv, 2, 5, &mut self.cache.bandwidth_cells[2][5], if mode==AppMode::DuplexTesting { "并发压测中" } else { "空闲" }.to_string());
+            // Row3 网卡
+            set_lv_cell(lv, 3, 0, &mut self.cache.bandwidth_cells[3][0], "网卡".to_string());
+            set_lv_cell(lv, 3, 1, &mut self.cache.bandwidth_cells[3][1], format_mbps(nic_up));
+            set_lv_cell(lv, 3, 2, &mut self.cache.bandwidth_cells[3][2], format_mbps(nic_down));
+            set_lv_cell(lv, 3, 3, &mut self.cache.bandwidth_cells[3][3], format!("{}/s", nic_summary.clone()));
+            set_lv_cell(lv, 3, 4, &mut self.cache.bandwidth_cells[3][4], format!("发{} 收{}", format_bytes(nic_tx), format_bytes(nic_rx)));
+            set_lv_cell(lv, 3, 5, &mut self.cache.bandwidth_cells[3][5], nic_summary.clone());
+            // Row4 节点排名
+            set_lv_cell(lv, 4, 0, &mut self.cache.bandwidth_cells[4][0], "排名".to_string());
+            set_lv_cell(lv, 4, 1, &mut self.cache.bandwidth_cells[4][1], up_rank.clone());
+            set_lv_cell(lv, 4, 2, &mut self.cache.bandwidth_cells[4][2], down_rank.clone());
+            set_lv_cell(lv, 4, 3, &mut self.cache.bandwidth_cells[4][3], "-".to_string());
+            set_lv_cell(lv, 4, 4, &mut self.cache.bandwidth_cells[4][4], "-".to_string());
+            set_lv_cell(lv, 4, 5, &mut self.cache.bandwidth_cells[4][5], format!("上{} 下{}", up_rank, down_rank));
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
+        }
+        // WAN ListView + header IP line with async alignment
+        let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw=="检测中..." { "检测中...".to_string() } else { wan_ip_raw.clone() };
+        let wan_age = {
+            let last = stats.wan_last_update_ms.load(Ordering::Relaxed);
+            if last==0 {"".to_string()} else {
+                let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+                let secs = now_ms.saturating_sub(last)/1000;
+                if secs < 120 { format!(" · {}s前", secs) } else { format!(" · {}m前", secs/60) }
+            }
+        };
+        let local_egress = if egress_ips.is_empty() { "未检测到".to_string() } else { egress_ips.join(", ") };
+        let wan_ip_text = format!("本机出口(本地): {} | 公网: {} (每35s{}) | 动态自适应", local_egress, wan_ip_disp, wan_age);
+        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_ip_text) };
+        // Update WAN table rows
+        let wan_rows = stats.wan_vertical_rows();
+        {
+            let lv = self.lv_wan;
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
+            for idx in 0..8 {
+                if idx < wan_rows.len() {
+                    let r = &wan_rows[idx];
+                    set_lv_cell(lv, idx as i32, 0, &mut self.cache.wan_cells[idx][0], format!("{}", idx+1));
+                    set_lv_cell(lv, idx as i32, 1, &mut self.cache.wan_cells[idx][1], r.label.clone());
+                    set_lv_cell(lv, idx as i32, 2, &mut self.cache.wan_cells[idx][2], if r.egress_ip=="-" { r.resolved.clone() } else { r.egress_ip.clone() });
+                    set_lv_cell(lv, idx as i32, 3, &mut self.cache.wan_cells[idx][3], format!("{}/{}", r.active, r.peak));
+                    set_lv_cell(lv, idx as i32, 4, &mut self.cache.wan_cells[idx][4], format!("{:.1}%", r.pct));
+                    set_lv_cell(lv, idx as i32, 5, &mut self.cache.wan_cells[idx][5], format!("{}ms", r.rtt));
+                    set_lv_cell(lv, idx as i32, 6, &mut self.cache.wan_cells[idx][6], format!("{:.1}%", r.share));
+                } else {
+                    let placeholder = if stats.mode()==crate::state::AppMode::Idle && idx==0 { "(空闲 — 开始测试后显示)" } else if wan_rows.is_empty() && idx==0 { "等待健康检查..." } else { "" };
+                    for col in 0..7 {
+                        let txt = if col==1 { placeholder.to_string() } else { "".to_string() };
+                        set_lv_cell(lv, idx as i32, col as i32, &mut self.cache.wan_cells[idx][col as usize], txt);
+                    }
+                }
+            }
+            let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
         }
 
         // Delta-append memory ring buffer log
@@ -1308,36 +1185,6 @@ impl UiState {
     }
 }
 
-#[cfg(test)]
-mod wan_egress_ip_tests {
-    use super::*;
-
-    #[test]
-    fn groups_probes_by_unique_public_egress_ip() {
-        let samples = parse_egress_ip_observations(
-            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=198.51.100.2 | icanhazip.com=203.0.113.1 | ifconfig.me=203.0.113.3",
-        );
-        let rows = build_wan_egress_rows(&samples);
-        assert_eq!(rows.iter().filter(|row| !row.is_empty()).count(), 3);
-        assert!(rows[0].contains("203.0.113.1"));
-        assert!(rows[0].contains("2"));
-        assert!(rows[0].contains("api.ipify.org"));
-        assert!(rows[1].contains("198.51.100.2"));
-        assert!(rows[2].contains("203.0.113.3"));
-    }
-
-    #[test]
-    fn same_public_ip_from_all_probes_is_one_egress() {
-        let samples = parse_egress_ip_observations(
-            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=203.0.113.1 | icanhazip.com=203.0.113.1",
-        );
-        let rows = build_wan_egress_rows(&samples);
-        assert_eq!(rows.iter().filter(|row| !row.is_empty()).count(), 1);
-        assert!(rows[0].contains("203.0.113.1"));
-        assert!(rows[0].contains("3"));
-    }
-}
-
 /// Draw bandwidth chart inside given rect using GDI (caller provides HDC from BeginPaint)
 unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::state::SharedStats, theme: &ThemeResources) {
     let rc = chart_rect;
@@ -1358,7 +1205,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(mem_bmp.0)) };
 
     // Fill background with card color
-    let fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
+    let mut fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
     let _ = unsafe { FillRect(mem_dc, &fill_rc, theme.brush_card) };
 
     // Border
@@ -1542,6 +1389,12 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
 
         let big_icon_sz = GetSystemMetrics(SM_CXICON).max(32);
         let sm_icon_sz = GetSystemMetrics(SM_CXSMICON).max(16);
+        // Init ListView common controls for table alignment (prevent freeze via double buffer)
+        unsafe {
+            let mut icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES as u32 };
+            InitCommonControlsEx(&icc);
+        }
+
         let hicon_big = create_app_icon(big_icon_sz);
         let hicon_sm = create_app_icon(sm_icon_sz);
 
@@ -1985,207 +1838,52 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            // Inner controls for Metrics (created BEFORE grp_metrics)
-            let lbl_conn_row1 = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
-            let lbl_conn_row2 = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let lbl_conn_row3 = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let lbl_up_row = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_ui,
-                )
-            };
-            let lbl_up_detail = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let lbl_down_row = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_ui,
-                )
-            };
-            let lbl_down_detail = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let grp_metrics = unsafe {
-                create_ctrl(
-                    w!("BUTTON"),
-                    " 实时测试指标监控 ",
-                    grp_style,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
-
-            // Bandwidth detail inner before group
-            let lbl_duplex_row = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
-            let lbl_nic_row = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let lbl_rank_row = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let grp_bandwidth = unsafe {
-                create_ctrl(
-                    w!("BUTTON"),
-                    " 带宽详情 · 网卡对比 · 节点排名 ",
-                    grp_style,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
-
-            // WAN public-IP table (unique egress addresses from independent probes)
-            // Create rows BEFORE group so they are above group in Z-order
-            let lbl_wan_ip = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "出口公网IP: 检测中...",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let lbl_wan_header = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    " 出口    公网出口 IP                               命中    探测来源",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_small,
-                )
-            };
-            let mut wan_rows: [HWND; MAX_EGRESS_IP_ROWS] = [HWND(std::ptr::null_mut()); MAX_EGRESS_IP_ROWS];
-            for i in 0..MAX_EGRESS_IP_ROWS {
-                wan_rows[i] = unsafe {
-                    create_ctrl(
-                        w!("STATIC"),
-                        "",
-                        st_left,
-                        0,
-                        hwnd,
-                        0,
-                        hinst,
-                        theme.font_small,
-                    )
-                };
+            // Metrics ListView (created before group for Z-order)
+            let lv_metrics = unsafe { create_listview(hwnd, hinst, theme.font_small) };
+            // Setup columns: 项目 | 当前 | 峰值/目标 | 成功率 | 详情 | 备注
+            unsafe {
+                let total_w = 860;
+                lv_insert_column(lv_metrics, 0, "类别", total_w*12/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_metrics, 1, "指标", total_w*15/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_metrics, 2, "当前", total_w*13/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_metrics, 3, "峰值/目标", total_w*16/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_metrics, 4, "成功率/速率", total_w*14/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_metrics, 5, "详情", total_w*30/100, LVCFMT_LEFT as i32);
+                for r in 0..7 { lv_insert_row(lv_metrics, r); }
             }
-            let grp_wan = unsafe {
-                create_ctrl(
-                    w!("BUTTON"),
-                    " WAN 出口公网 IP（按探测到的唯一公网地址聚合） ",
-                    grp_style,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
+            let grp_metrics = unsafe {
+                create_ctrl(w!("BUTTON"), " 实时测试指标 (表格·自动对齐) ", grp_style, 0, hwnd, 0, hinst, theme.font_bold)
             };
+
+            let lv_bandwidth = unsafe { create_listview(hwnd, hinst, theme.font_small) };
+            unsafe {
+                let total_w = 860;
+                lv_insert_column(lv_bandwidth, 0, "类型", total_w*12/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_bandwidth, 1, "实时", total_w*15/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_bandwidth, 2, "峰值", total_w*13/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_bandwidth, 3, "平均/P95", total_w*16/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_bandwidth, 4, "累计/并发", total_w*18/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_bandwidth, 5, "详情", total_w*26/100, LVCFMT_LEFT as i32);
+                for r in 0..5 { lv_insert_row(lv_bandwidth, r); }
+            }
+            let grp_bandwidth = unsafe {
+                create_ctrl(w!("BUTTON"), " 宽带详情 · 网卡对比 · 节点排名 (表格) ", grp_style, 0, hwnd, 0, hinst, theme.font_bold)
+            };
+
+            let lbl_wan_ip = unsafe { create_ctrl(w!("STATIC"), "出口公网IP: 检测中...", st_left, 0, hwnd, 0, hinst, theme.font_small) };
+            let lv_wan = unsafe { create_listview(hwnd, hinst, theme.font_small) };
+            unsafe {
+                let total_w = 860;
+                lv_insert_column(lv_wan, 0, "#", total_w*5/100, LVCFMT_CENTER as i32);
+                lv_insert_column(lv_wan, 1, "目标(出口标识)", total_w*24/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 2, "本地出口IP", total_w*18/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 3, "存活/峰值", total_w*13/100, LVCFMT_CENTER as i32);
+                lv_insert_column(lv_wan, 4, "成功率", total_w*10/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_wan, 5, "RTT", total_w*8/100, LVCFMT_RIGHT as i32);
+                lv_insert_column(lv_wan, 6, "占比", total_w*9/100, LVCFMT_RIGHT as i32);
+                for r in 0..8 { lv_insert_row(lv_wan, r); }
+            }
+            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 出口分布 (表格·自动推测·竖排) ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
 
             // Chart title (static bold) - chart body painted on parent DC
             let lbl_chart_title = unsafe {
@@ -2229,58 +1927,18 @@ unsafe extern "system" fn wnd_proc(
             };
 
             let mut ui = Box::new(UiState {
-                app,
-                engine,
-                theme,
+                app, engine, theme,
                 cache: LabelCache::default(),
-                last_mode_active: None,
-                log_gen: 0,
-                log_seq: 0,
-                chart_rect: RECT::default(),
-                lbl_title,
-                lbl_status,
-                lbl_mem_badge,
-                grp_config,
-                lbl_streams,
-                edit_streams,
-                lbl_max_conns,
-                edit_max_conns,
-                lbl_hold_secs,
-                edit_hold_secs,
-                chk_continuous,
-                lbl_tcp_targets,
-                edit_tcp_targets,
-                lbl_up_targets,
-                edit_up_targets,
-                lbl_down_targets,
-                edit_down_targets,
-                btn_conn,
-                btn_up,
-                btn_down,
-                btn_duplex,
-                btn_stop,
-                btn_reset,
-                btn_clear_log,
-                btn_help,
-                grp_metrics,
-                lbl_conn_row1,
-                lbl_conn_row2,
-                lbl_conn_row3,
-                lbl_up_row,
-                lbl_up_detail,
-                lbl_down_row,
-                lbl_down_detail,
-                grp_bandwidth,
-                lbl_duplex_row,
-                lbl_nic_row,
-                lbl_rank_row,
-                grp_wan,
-                lbl_wan_ip,
-                lbl_wan_header,
-                wan_rows,
+                last_mode_active: None, log_gen: 0, log_seq: 0, chart_rect: RECT::default(),
+                lbl_title, lbl_status, lbl_mem_badge,
+                grp_config, lbl_streams, edit_streams, lbl_max_conns, edit_max_conns, lbl_hold_secs, edit_hold_secs, chk_continuous,
+                lbl_tcp_targets, edit_tcp_targets, lbl_up_targets, edit_up_targets, lbl_down_targets, edit_down_targets,
+                btn_conn, btn_up, btn_down, btn_duplex, btn_stop, btn_reset, btn_clear_log, btn_help,
+                grp_metrics, lv_metrics,
+                grp_bandwidth, lv_bandwidth,
+                grp_wan, lv_wan, lbl_wan_ip,
                 lbl_chart_title,
-                grp_log,
-                edit_log,
+                grp_log, edit_log,
             });
 
             let mut rc = RECT::default();
@@ -2360,7 +2018,7 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         ui.theme.colors.active
                     }
-                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row3 || ctrl == ui.lbl_nic_row || ctrl == ui.lbl_rank_row {
+                } else if ctrl == ui.lbl_mem_badge {
                     ui.theme.colors.text_muted
                 } else {
                     ui.theme.colors.text_primary
@@ -2492,13 +2150,13 @@ unsafe extern "system" fn wnd_proc(
                         let help_text = concat!(
                             "1. 纯内存原则：配置、统计和日志全部保存在进程内存中，退出即销毁，不读写本地磁盘或注册表。\n\n",
                             "2. 测速准确性：\n",
-                            "  · 上行统计区分【HTTP Body 已交给客户端发送流】与【完整请求体后收到 2xx 响应】；2xx 不等于逐字节服务端 ACK；\n",
+                            "  · 上行严格区分【生成数据量/客户端发送量/服务端确认接收量】，仅服务端确认量计入有效速率；\n",
                             "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
                             "  · 失败请求独立统计，不计入成功率分母。\n\n",
                             "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
-                            "4. WAN 出口公网 IP：程序并行访问多个独立公网 IP 查询服务，将返回的公网出口 IP 去重后按出口地址分组显示。每个不同公网 IP 代表本轮探测观察到的一种出口身份；命中数表示有多少探测服务看到了该 IP，不是带宽占比。出口编号仅用于列表展示，不等同于路由器物理 WAN1/WAN2 端口编号。\n\n",
+                            "4. 多 WAN 说明：单条 TCP 连接仅走单条出口，多目标并发才会分散至多条线路；本工具按独立 IP 列表原子轮询分散连接，并记录各 IP 连接数与速率，但不假设多 IP=多 WAN，需对照路由器/网卡实际流量验证。\n\n",
                             "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
-                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 汇总物理网卡流量并排除虚拟接口；系统 IPv4 TCP 重传率按采样增量计算。\n\n",
+                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样网卡收发字节、名称、状态、链路速率，对比应用流量与网卡总流量，并显示 TCP 重传率与 RTT/失败率。\n\n",
                             "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
                         );
                         let wide = to_wide_null(help_text);

@@ -33,7 +33,11 @@ https://test.nju.edu.cn/backend/empty.php, \
 http://speed.neu.edu.cn/empty.php, \
 https://iptv.tsinghua.edu.cn/st/empty.php, \
 https://speed.nuaa.edu.cn/backend/empty.php, \
-https://speed.cloudflare.com/__up";
+https://speed.cloudflare.com/__up, \
+https://arms-retcode.aliyuncs.com/r.png, \
+https://snowflake.qq.com/, \
+https://gatherer.m.qq.com/, \
+https://galileotelemetry.tencent.com/collect";
 
 pub const DEFAULT_STREAM_CONCURRENCY: usize = 16;
 pub const DEFAULT_MAX_CONNS_CAP: usize = 30_000;
@@ -140,6 +144,7 @@ pub struct TargetMetrics {
 
     pub rtt_sum_ms: AtomicU64,
     pub rtt_cnt: AtomicU64,
+    pub egress_map: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl TargetMetrics {
@@ -162,6 +167,7 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
+            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -184,6 +190,7 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
+            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -224,6 +231,27 @@ impl TargetMetrics {
             (self.orig_success.load(Ordering::Relaxed) as f64) * 100.0 / (att as f64)
         }
     }
+
+    pub fn record_egress(&self, local_ip: String) {
+        if local_ip.is_empty() || local_ip=="0.0.0.0" { return; }
+        let mut m = self.egress_map.lock();
+        *m.entry(local_ip).or_insert(0) += 1;
+    }
+    pub fn egress_summary(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        let top = v.into_iter().take(2).map(|(ip,c)| format!("{}({})", ip, c)).collect::<Vec<_>>().join(",");
+        top
+    }
+    pub fn egress_primary_ip(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        v[0].0.clone()
+    }
 }
 
 /// Per-IP endpoint stats under a bandwidth target (for multi-IP / multi-WAN dispersion).
@@ -256,7 +284,8 @@ pub struct NodeSpeedMetrics {
     pub url: String,
     pub probe_bps: AtomicU64,
     pub ema_bps: AtomicU64,
-    pub bytes_succeeded: AtomicU64,
+    pub bytes_confirmed: AtomicU64,
+    pub bytes_client: AtomicU64,
     pub requests_ok: AtomicU64,
     pub requests_fail: AtomicU64,
     pub consecutive_fails: AtomicU32,
@@ -296,7 +325,8 @@ impl NodeSpeedMetrics {
             url,
             probe_bps: AtomicU64::new(probe_bps),
             ema_bps: AtomicU64::new(probe_bps),
-            bytes_succeeded: AtomicU64::new(0),
+            bytes_confirmed: AtomicU64::new(0),
+            bytes_client: AtomicU64::new(0),
             requests_ok: AtomicU64::new(0),
             requests_fail: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
@@ -316,16 +346,16 @@ impl NodeSpeedMetrics {
         }
     }
 
-    pub fn record_success(&self, successful_bytes: u64, elapsed_ms: u64) {
-        self.bytes_succeeded
-            .fetch_add(successful_bytes, Ordering::Relaxed);
+    pub fn record_success(&self, confirmed_bytes: u64, elapsed_ms: u64) {
+        self.bytes_confirmed
+            .fetch_add(confirmed_bytes, Ordering::Relaxed);
         self.requests_ok.fetch_add(1, Ordering::Relaxed);
         self.consecutive_fails.store(0, Ordering::Relaxed);
         self.latency_sum_ms
             .fetch_add(elapsed_ms.max(1), Ordering::Relaxed);
         self.latency_cnt.fetch_add(1, Ordering::Relaxed);
 
-        let bps = ((successful_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
+        let bps = ((confirmed_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
         let prev = self.ema_bps.load(Ordering::Relaxed);
         let next = if prev == 0 {
             bps
@@ -385,9 +415,10 @@ impl NodeSpeedMetrics {
 }
 
 #[derive(Debug, Clone)]
-pub struct TargetDistributionRow {
+pub struct WanRow {
     pub label: String,
     pub resolved: String,
+    pub egress_ip: String,
     pub active: usize,
     pub peak: usize,
     pub pct: f64,
@@ -434,10 +465,11 @@ pub struct SharedStats {
     pub conn_targets_healthy: AtomicUsize,
     pub target_metrics: Mutex<Vec<Arc<TargetMetrics>>>,
 
-    // Upload accounting: body bytes yielded to the HTTP client and complete 2xx request bytes.
-    // HTTP success is not a byte-level server receipt acknowledgement.
+    // Uploader counters (strict separation of generated / client-sent / server-confirmed)
     pub up_bytes_total: AtomicU64,
-    pub up_bytes_body_yielded: AtomicU64,
+    pub up_bytes_generated: AtomicU64,
+    pub up_bytes_client_sent: AtomicU64,
+    pub up_bytes_confirmed: AtomicU64,
     pub up_active_streams: AtomicUsize,
     pub up_current_concurrency: AtomicUsize,
     pub up_best_concurrency: AtomicUsize,
@@ -482,9 +514,9 @@ pub struct SharedStats {
     // Chart history (up to 120 points = 60s at 500ms)
     pub speed_history: Mutex<VecDeque<SpeedSamplePoint>>,
 
-    // Public egress IP observations grouped by probe destination; not WAN identities.
-    pub egress_ip_observations: Mutex<String>,
-    pub egress_ip_last_update_ms: AtomicU64,
+    // WAN egress public IP auto-detected
+    pub wan_public_ip: Mutex<String>,
+    pub wan_last_update_ms: AtomicU64,
 }
 
 impl Default for SharedStats {
@@ -513,7 +545,9 @@ impl Default for SharedStats {
             conn_targets_healthy: AtomicUsize::new(0),
             target_metrics: Mutex::new(Vec::new()),
             up_bytes_total: AtomicU64::new(0),
-            up_bytes_body_yielded: AtomicU64::new(0),
+            up_bytes_generated: AtomicU64::new(0),
+            up_bytes_client_sent: AtomicU64::new(0),
+            up_bytes_confirmed: AtomicU64::new(0),
             up_active_streams: AtomicUsize::new(0),
             up_current_concurrency: AtomicUsize::new(0),
             up_best_concurrency: AtomicUsize::new(0),
@@ -551,8 +585,8 @@ impl Default for SharedStats {
             nic_rx_total: AtomicU64::new(0),
             nic_summary: Mutex::new("网卡检测中...".to_string()),
             speed_history: Mutex::new(VecDeque::with_capacity(120)),
-            egress_ip_observations: Mutex::new("等待探测".to_string()),
-            egress_ip_last_update_ms: AtomicU64::new(0),
+            wan_public_ip: Mutex::new("检测中...".to_string()),
+            wan_last_update_ms: AtomicU64::new(0),
         }
     }
 }
@@ -592,7 +626,9 @@ impl SharedStats {
 
     pub fn reset_upload_run(&self) {
         self.up_bytes_total.store(0, Ordering::Relaxed);
-        self.up_bytes_body_yielded.store(0, Ordering::Relaxed);
+        self.up_bytes_generated.store(0, Ordering::Relaxed);
+        self.up_bytes_client_sent.store(0, Ordering::Relaxed);
+        self.up_bytes_confirmed.store(0, Ordering::Relaxed);
         self.up_active_streams.store(0, Ordering::Relaxed);
         self.up_current_concurrency.store(0, Ordering::Relaxed);
         self.up_best_concurrency.store(0, Ordering::Relaxed);
@@ -729,7 +765,7 @@ impl SharedStats {
         }
     }
 
-    pub fn target_distribution_summary(&self) -> String {
+    pub fn wan_distribution_summary(&self) -> String {
         let guard = self.target_metrics.lock();
         let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
         if healthy.is_empty() {
@@ -759,8 +795,8 @@ impl SharedStats {
         parts.join(" · ")
     }
 
-    /// Remote-target rows sorted by current active connections, with current active share %
-    pub fn target_distribution_rows(&self) -> Vec<TargetDistributionRow> {
+    /// Vertical WAN rows: one per healthy target, sorted by active desc, with share %
+    pub fn wan_vertical_rows(&self) -> Vec<WanRow> {
         let guard = self.target_metrics.lock();
         let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
         if healthy.is_empty() {
@@ -775,9 +811,11 @@ impl SharedStats {
             let pct = t.orig_success_rate_pct();
             let rtt = t.avg_rtt_ms();
             let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
-            TargetDistributionRow {
+            let egress_ip = t.egress_primary_ip();
+            WanRow {
                 label: t.label.clone(),
                 resolved: t.resolved_addr.clone(),
+                egress_ip,
                 active: act,
                 peak,
                 pct,

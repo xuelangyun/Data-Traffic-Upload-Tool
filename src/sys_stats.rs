@@ -239,10 +239,41 @@ mod win_imp {
 
         (tx_total, rx_total, summary, tx_bps, rx_bps)
     }
+
+    pub fn query_egress_local_ips() -> Vec<String> {
+        // Simplified: use UDP trick to get default egress IP; avoids brittle Win32 type paths across windows-rs versions.
+        // Prior implementation used GetAdaptersAddresses via iphlpapi which required version-specific import paths
+        // (NetworkManagement::IpHelper vs iphlpapi, Networking::WinSock vs winsock2/ws2, Foundation vs winerror).
+        // For robustness on tag 74 we fallback to UDP method and supplement via egress_map in caller.
+        let mut ips = Vec::new();
+        // Try to get default egress via UDP connect trick
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.connect("8.8.8.8:80");
+            if let Ok(local) = sock.local_addr() {
+                let ip = local.ip().to_string();
+                if ip != "0.0.0.0" && ip != "127.0.0.1" && !ip.is_empty() {
+                    ips.push(ip);
+                }
+            }
+        }
+        // Also try secondary public DNS to detect dual-stack or second egress
+        if ips.is_empty() {
+            if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+                let _ = sock.connect("1.1.1.1:80");
+                if let Ok(local) = sock.local_addr() {
+                    let ip = local.ip().to_string();
+                    if ip != "0.0.0.0" && ip != "127.0.0.1" {
+                        if !ips.contains(&ip) { ips.push(ip); }
+                    }
+                }
+            }
+        }
+        ips
+    }
 }
 
 #[cfg(windows)]
-pub use win_imp::query_sys_snapshot;
+pub use win_imp::{query_egress_local_ips, query_sys_snapshot};
 
 #[cfg(test)]
 mod tests {

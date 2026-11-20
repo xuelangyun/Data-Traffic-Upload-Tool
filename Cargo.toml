@@ -1,6 +1,6 @@
 [package]
 name = "win_net_stress"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.96"
 description = "Pure in-memory native Windows (Win32 API) public network connection & bandwidth stress tester"
@@ -15,6 +15,11 @@ futures-core = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", features = [
+    "commctrl",
+    "winsock2",
+    "winerror",
+    "ws2",
+    "iptypes",
     "iphlpapi",
     "libloaderapi",
     "netioapi",
