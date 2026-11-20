@@ -2,8 +2,11 @@ name: Build & Release Windows Binary
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
+    paths:
+      - "Cargo.toml"
+      - ".github/workflows/release.yml"
   pull_request:
   workflow_dispatch:
     inputs:
@@ -46,7 +49,9 @@ jobs:
             throw "Failed to parse version from Cargo.toml"
           }
 
-          if ("${{ github.event_name }}" -eq "push") {
+          $eventName = "${{ github.event_name }}"
+          $refType = "${{ github.ref_type }}"
+          if ($eventName -eq "push" -and $refType -eq "tag") {
             $tag = "${{ github.ref_name }}"
           } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.tag }}")) {
             $tag = "${{ inputs.tag }}".Trim()
