@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -132,7 +133,7 @@ jobs:
           if-no-files-found: error
 
       - name: Create GitHub Release
-        if: success()
+        if: success() && github.event_name != 'pull_request'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
