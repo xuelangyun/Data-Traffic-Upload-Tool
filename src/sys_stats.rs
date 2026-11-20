@@ -19,10 +19,9 @@ mod win_imp {
     use std::sync::Mutex;
     use std::time::Instant;
     // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
-    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
-    use windows::Win32::iphlpapi::{
-        FreeMibTable, GetIfTable2, GetTcpStatistics, MIB_IF_ROW2, MIB_IF_TABLE2, MIB_TCPSTATS_LH,
-    };
+    use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
+    use windows::Win32::iphlpapi::{GetTcpStatistics, MIB_TCPSTATS_LH};
+    use windows::Win32::netioapi::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
     use windows::Win32::sysinfoapi::GetLocalTime;
 
     const IF_TYPE_LOOPBACK: u32 = 24;

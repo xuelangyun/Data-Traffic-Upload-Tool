@@ -1218,7 +1218,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let _ = unsafe { FillRect(mem_dc, &fill_rc, theme.brush_card) };
 
     // Border
-    let pen_border = unsafe { CreatePen(PS_SOLID as u32, 1, rgb(200, 200, 200)) };
+    let pen_border = unsafe { CreatePen(PS_SOLID, 1, rgb(200, 200, 200)) };
     let old_pen = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_border.0)) };
     let old_brush = unsafe { SelectObject(mem_dc, HGDIOBJ(GetStockObject(NULL_BRUSH).0)) };
     let _ = unsafe { Rectangle(mem_dc, 0, 0, w, h) };
@@ -1247,10 +1247,10 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let max_mbps = (max_bps as f64) / 1_000_000.0;
 
     // Grid lines (4 horizontal)
-    let pen_grid = unsafe { CreatePen(PS_DOT as u32, 1, rgb(220, 220, 220)) };
+    let pen_grid = unsafe { CreatePen(PS_DOT, 1, rgb(220, 220, 220)) };
     let _ = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_grid.0)) };
     for i in 1..4 {
-        let y = chart_t + (chart_h * i) / 4;
+        let y = chart_t + (chart_h * i as i32) / 4;
         let _ = unsafe { MoveToEx(mem_dc, chart_l, y, None) };
         let _ = unsafe { LineTo(mem_dc, chart_r, y) };
     }
@@ -1260,26 +1260,26 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let _ = unsafe { SetBkMode(mem_dc, TRANSPARENT) };
     let _ = unsafe { SetTextColor(mem_dc, theme.colors.text_muted) };
     for i in 0..=4 {
-        let frac = (4 - i) as f64 / 4.0;
+        let frac = (4 - i as i32) as f64 / 4.0;
         let mbps = max_mbps * frac;
         let label = if mbps >= 100.0 { format!("{mbps:.0}") } else { format!("{mbps:.1}") };
-        let y = chart_t + (chart_h * i) / 4 - scale_px(6, theme.dpi);
+        let y = chart_t + (chart_h * i as i32) / 4 - scale_px(6, theme.dpi);
         let mut tr = RECT { left: scale_px(2, theme.dpi), top: y, right: pad_l - scale_px(2, theme.dpi), bottom: y + scale_px(14, theme.dpi) };
         let wide = to_wide_null(&label);
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_RIGHT.0 | DT_SINGLELINE.0) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_RIGHT | DT_SINGLELINE) };
     }
     // X-axis time labels (0s .. 60s)
     for i in 0..=3 {
-        let x = chart_l + (chart_w * i) / 3;
-        let secs = (60 * i) / 3;
+        let x = chart_l + (chart_w * i as i32) / 3;
+        let secs = (60 * i as i32) / 3;
         let label = format!("{secs}s");
         let wide = to_wide_null(&label);
         let mut tr = RECT { left: x - scale_px(14, theme.dpi), top: chart_b + scale_px(2, theme.dpi), right: x + scale_px(14, theme.dpi), bottom: chart_b + scale_px(14, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_CENTER.0 | DT_SINGLELINE.0) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_CENTER | DT_SINGLELINE) };
     }
 
     // Helper to plot a series
-    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: u32| {
+    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: PEN_STYLE| {
         if points.len() < 2 { return; }
         let pen = unsafe { CreatePen(style, width, color) };
         let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
@@ -1353,7 +1353,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let ly = chart_t + scale_px(4, theme.dpi);
     for (label, color) in legend_items {
         // color box
-        let pen = unsafe { CreatePen(PS_SOLID as u32, 2, color) };
+        let pen = unsafe { CreatePen(PS_SOLID, 2, color) };
         let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
         let bx1 = lx;
         let by1 = ly;
@@ -1366,7 +1366,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         // text
         let wide = to_wide_null(label);
         let mut tr = RECT { left: bx2 + scale_px(4, theme.dpi), top: ly - scale_px(6, theme.dpi), right: bx2 + scale_px(60, theme.dpi), bottom: ly + scale_px(8, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_LEFT.0 | DT_SINGLELINE.0) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_LEFT | DT_SINGLELINE) };
         lx += scale_px(52, theme.dpi);
         if label.len() > 8 { lx += scale_px(20, theme.dpi); }
     }
