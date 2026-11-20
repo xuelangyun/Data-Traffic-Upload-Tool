@@ -1266,7 +1266,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         let y = chart_t + (chart_h * i) / 4 - scale_px(6, theme.dpi);
         let mut tr = RECT { left: scale_px(2, theme.dpi), top: y, right: pad_l - scale_px(2, theme.dpi), bottom: y + scale_px(14, theme.dpi) };
         let wide = to_wide_null(&label);
-        let _ = unsafe { DrawTextW(mem_dc, &wide[..wide.len()-1], &mut tr, DT_RIGHT as u32 | DT_SINGLELINE as u32) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_RIGHT.0 | DT_SINGLELINE.0) };
     }
     // X-axis time labels (0s .. 60s)
     for i in 0..=3 {
@@ -1275,7 +1275,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         let label = format!("{secs}s");
         let wide = to_wide_null(&label);
         let mut tr = RECT { left: x - scale_px(14, theme.dpi), top: chart_b + scale_px(2, theme.dpi), right: x + scale_px(14, theme.dpi), bottom: chart_b + scale_px(14, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, &wide[..wide.len()-1], &mut tr, DT_CENTER as u32 | DT_SINGLELINE as u32) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_CENTER.0 | DT_SINGLELINE.0) };
     }
 
     // Helper to plot a series
@@ -1366,7 +1366,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
         // text
         let wide = to_wide_null(label);
         let mut tr = RECT { left: bx2 + scale_px(4, theme.dpi), top: ly - scale_px(6, theme.dpi), right: bx2 + scale_px(60, theme.dpi), bottom: ly + scale_px(8, theme.dpi) };
-        let _ = unsafe { DrawTextW(mem_dc, &wide[..wide.len()-1], &mut tr, DT_LEFT as u32 | DT_SINGLELINE as u32) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, DT_LEFT.0 | DT_SINGLELINE.0) };
         lx += scale_px(52, theme.dpi);
         if label.len() > 8 { lx += scale_px(20, theme.dpi); }
     }

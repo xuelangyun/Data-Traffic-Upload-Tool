@@ -18,10 +18,12 @@ mod win_imp {
     use super::SysSnapshot;
     use std::sync::Mutex;
     use std::time::Instant;
-    use windows::Win32::NetworkManagement::IpHelper::{
+    // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    use windows::Win32::iphlpapi::{
         FreeMibTable, GetIfTable2, GetTcpStatistics, MIB_IF_ROW2, MIB_IF_TABLE2, MIB_TCPSTATS_LH,
     };
-    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    use windows::Win32::sysinfoapi::GetLocalTime;
 
     const IF_TYPE_LOOPBACK: u32 = 24;
 
@@ -100,18 +102,11 @@ mod win_imp {
 
         for i in 0..num {
             let row: &MIB_IF_ROW2 = unsafe { &*table.Table.as_ptr().add(i) };
-            // Filter only physical non-loopback adapters with MAC; avoid strict enum checks
-            // for portability across windows-rs tag 74 bitfield representations.
             let is_loopback = row.Type == IF_TYPE_LOOPBACK;
             let has_mac = row.PhysicalAddressLength > 0;
             if is_loopback || !has_mac {
                 continue;
             }
-            // Additional guard: skip interfaces that are clearly not up (best-effort via numeric cast)
-            // OperStatus and MediaConnectState may be enums/bitfields; we do a conservative check:
-            // if either converts to 0, treat as not fully operational but still allow if traffic seen.
-            // Instead, rely on traffic presence: adapters with zero octets are likely not useful.
-            // Keep them but they will naturally contribute little.
 
             let tx = row.OutOctets;
             let rx = row.InOctets;
@@ -224,7 +219,7 @@ pub fn query_sys_snapshot() -> SysSnapshot {
 /// Format current local time as `HH:MM:SS` without touching filesystem / tz files.
 #[cfg(windows)]
 pub fn format_local_hms() -> String {
-    use windows::Win32::System::SystemInformation::GetLocalTime;
+    use windows::Win32::sysinfoapi::GetLocalTime;
     let st = unsafe { GetLocalTime() };
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
