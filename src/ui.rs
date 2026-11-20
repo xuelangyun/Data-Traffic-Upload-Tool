@@ -2,7 +2,6 @@
 //! Zero disk usage: all controls, metrics, and ring-buffer logs live strictly in RAM.
 
 use std::ffi::c_void;
-use std::ptr::null_mut;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -69,7 +68,7 @@ struct Controls {
 
 impl Default for Controls {
     fn default() -> Self {
-        let z: HWND = null_mut();
+        let z = HWND::default();
         Self {
             grp_stats: z,
             lbl_mode: z,
@@ -116,9 +115,9 @@ struct WindowData {
 
 impl Drop for WindowData {
     fn drop(&mut self) {
-        if self.owns_font && !self.font.is_null() {
+        if self.owns_font && !self.font.0.is_null() {
             unsafe {
-                let _ = DeleteObject(self.font.cast());
+                let _ = DeleteObject(HGDIOBJ(self.font.0));
             }
         }
     }
@@ -165,11 +164,11 @@ fn create_ui_font() -> (HFONT, bool) {
         .as_bool()
         {
             let font = CreateFontIndirectW(&ncm.lfMessageFont);
-            if !font.is_null() {
+            if !font.0.is_null() {
                 return (font, true);
             }
         }
-        (GetStockObject(DEFAULT_GUI_FONT).cast(), false)
+        (HFONT(GetStockObject(DEFAULT_GUI_FONT).0), false)
     }
 }
 
@@ -186,7 +185,7 @@ unsafe fn spawn_child(
     let hmenu = if id == 0 {
         None
     } else {
-        Some((id as usize) as HMENU)
+        Some(HMENU(id as usize as *mut c_void))
     };
     let hwnd = unsafe {
         CreateWindowExW(
@@ -205,9 +204,14 @@ unsafe fn spawn_child(
         )
     };
 
-    if !hwnd.is_null() && !font.is_null() {
+    if !hwnd.0.is_null() && !font.0.is_null() {
         unsafe {
-            SendMessageW(hwnd, WM_SETFONT as u32, font as usize, 0);
+            SendMessageW(
+                hwnd,
+                WM_SETFONT as u32,
+                WPARAM(font.0 as usize),
+                LPARAM(0),
+            );
         }
     }
     hwnd
@@ -483,7 +487,7 @@ fn create_controls(hwnd: HWND, data: &mut WindowData) {
             font,
         );
         c.edit_log = spawn_child(hwnd, ex_edge, w!("EDIT"), "", edit_log_style, 0, font);
-        SendMessageW(c.edit_log, EM_SETLIMITTEXT, 0, 0);
+        SendMessageW(c.edit_log, EM_SETLIMITTEXT, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -680,8 +684,13 @@ fn refresh_ui(data: &mut WindowData) {
         set_window_text(c.edit_log, &joined);
         unsafe {
             let len = GetWindowTextLengthW(c.edit_log).max(0);
-            SendMessageW(c.edit_log, EM_SETSEL, len as usize, len as isize);
-            SendMessageW(c.edit_log, EM_SCROLLCARET, 0, 0);
+            SendMessageW(
+                c.edit_log,
+                EM_SETSEL,
+                WPARAM(len as usize),
+                LPARAM(len as isize),
+            );
+            SendMessageW(c.edit_log, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
         }
     } else if !lines.is_empty() {
         let mut chunk = lines.join("\r\n");
@@ -689,9 +698,19 @@ fn refresh_ui(data: &mut WindowData) {
         let w_chunk = to_wide(&chunk);
         unsafe {
             let len = GetWindowTextLengthW(c.edit_log).max(0);
-            SendMessageW(c.edit_log, EM_SETSEL, len as usize, len as isize);
-            SendMessageW(c.edit_log, EM_REPLACESEL, 0, w_chunk.as_ptr() as isize);
-            SendMessageW(c.edit_log, EM_SCROLLCARET, 0, 0);
+            SendMessageW(
+                c.edit_log,
+                EM_SETSEL,
+                WPARAM(len as usize),
+                LPARAM(len as isize),
+            );
+            SendMessageW(
+                c.edit_log,
+                EM_REPLACESEL,
+                WPARAM(0),
+                LPARAM(w_chunk.as_ptr() as isize),
+            );
+            SendMessageW(c.edit_log, EM_SCROLLCARET, WPARAM(0), LPARAM(0));
         }
     }
 
@@ -804,7 +823,7 @@ unsafe extern "system" fn wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_NCCREATE as u32 {
-        let cs = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let cs = unsafe { &*(lparam.0 as *const CREATESTRUCTW) };
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize);
         }
@@ -825,31 +844,31 @@ unsafe extern "system" fn wndproc(
             unsafe {
                 SetTimer(Some(hwnd), TIMER_REFRESH_ID, 250, None);
             }
-            0
+            LRESULT(0)
         }
         WM_SIZE => {
             layout_controls(hwnd, data);
-            0
+            LRESULT(0)
         }
         WM_GETMINMAXINFO => {
-            let mmi = unsafe { &mut *(lparam as *mut MINMAXINFO) };
+            let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             mmi.ptMinTrackSize.x = 840;
             mmi.ptMinTrackSize.y = 620;
-            0
+            LRESULT(0)
         }
         WM_TIMER => {
-            if wparam == TIMER_REFRESH_ID {
+            if wparam.0 == TIMER_REFRESH_ID {
                 refresh_ui(data);
             }
-            0
+            LRESULT(0)
         }
         WM_COMMAND => {
-            let id = (wparam & 0xFFFF) as u16;
-            let code = ((wparam >> 16) & 0xFFFF) as u16;
+            let id = (wparam.0 & 0xFFFF) as u16;
+            let code = ((wparam.0 >> 16) & 0xFFFF) as u16;
             if code == BN_CLICKED as u16 {
                 handle_command(hwnd, id, data);
             }
-            0
+            LRESULT(0)
         }
         WM_DESTROY => {
             unsafe {
@@ -859,14 +878,14 @@ unsafe extern "system" fn wndproc(
             unsafe {
                 PostQuitMessage(0);
             }
-            0
+            LRESULT(0)
         }
         WM_NCDESTROY => {
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));
             }
-            0
+            LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -878,13 +897,13 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
     }
 
     let hinstance = unsafe { GetModuleHandleW(PCWSTR::null()) };
-    if hinstance.is_null() {
+    if hinstance.0.is_null() {
         return Err("GetModuleHandleW failed".to_string());
     }
 
     let class_name = w!("WinNetStressMainWnd");
-    let hcursor = unsafe { LoadCursorW(None, PCWSTR(IDC_ARROW.0.cast())) };
-    if hcursor.is_null() {
+    let hcursor = unsafe { LoadCursorW(None, IDC_ARROW) };
+    if hcursor.0.is_null() {
         return Err("LoadCursorW failed".to_string());
     }
     let hbrush = unsafe { GetSysColorBrush(COLOR_BTNFACE) };
@@ -909,7 +928,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         state,
         engine,
         controls: Controls::default(),
-        font: null_mut(),
+        font: HFONT::default(),
         owns_font: false,
         seen_log_gen: 0,
         seen_log_seq: 0,
@@ -934,7 +953,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         )
     };
 
-    if hwnd.is_null() {
+    if hwnd.0.is_null() {
         unsafe {
             drop(Box::from_raw(raw_ptr));
         }

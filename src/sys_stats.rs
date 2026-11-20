@@ -40,10 +40,7 @@ pub fn query_sys_snapshot() -> SysSnapshot {
 #[cfg(windows)]
 pub fn format_local_hms() -> String {
     use windows::Win32::*;
-    let mut st = SYSTEMTIME::default();
-    unsafe {
-        GetLocalTime(&mut st);
-    }
+    let st = unsafe { GetLocalTime() };
     format!("{:02}:{:02}:{:02}", st.wHour, st.wMinute, st.wSecond)
 }
 
