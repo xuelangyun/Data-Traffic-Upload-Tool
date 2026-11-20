@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 
 use crate::conn_tester::{CancelToken, run_conn_test};
 use crate::downloader::run_download_test;
-use crate::state::{AppMode, AppState, TestConfig};
+use crate::state::{AppMode, AppState, EgressIpObservation, TestConfig};
 use crate::sys_stats::query_sys_snapshot;
 use crate::uploader::run_upload_test;
 
@@ -357,9 +357,9 @@ fn init_runtime_once<'a>(
                 "https://icanhazip.com",
                 "https://ifconfig.me/ip",
                 "https://ipinfo.io/ip",
-                "https://api64.ipify.org",
-                "https://ipv4.icanhazip.com",
-                "https://ipv6.icanhazip.com",
+                "https://ident.me",
+                "https://ifconfig.co/ip",
+                "https://ipecho.net/plain",
             ];
             loop {
                 // Independent destinations can be routed through different WANs by
@@ -381,7 +381,10 @@ fn init_runtime_once<'a>(
                         let body = response.text().await.ok()?;
                         let ip = body.trim().parse::<std::net::IpAddr>().ok()?;
                         let provider = url.split('/').nth(2).unwrap_or(url);
-                        Some(format!("{provider}={ip}"))
+                        Some(EgressIpObservation {
+                            provider: provider.to_string(),
+                            ip: ip.to_string(),
+                        })
                     });
                 }
                 let mut observations = Vec::new();
@@ -390,11 +393,16 @@ fn init_runtime_once<'a>(
                         observations.push(observation);
                     }
                 }
+                // Keep the previous successful snapshot when every endpoint fails.
+                // A partial successful batch replaces it and is visible with its own hit counts.
                 if !observations.is_empty() {
-                    let summary = observations.join(" | ");
-                    *wan_stats.egress_ip_observations.lock() = summary;
+                    observations.sort_by(|a, b| a.provider.cmp(&b.provider));
+                    *wan_stats.egress_ip_observations.lock() = observations;
                     wan_stats.egress_ip_last_update_ms.store(
-                        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64,
                         Ordering::Relaxed,
                     );
                 }
