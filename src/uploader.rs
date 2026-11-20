@@ -134,7 +134,6 @@ struct InMemoryUploadStream {
     offset: usize,
     remaining: usize,
     stats: Option<Arc<SharedStats>>,
-    node_metrics: Option<Arc<NodeSpeedMetrics>>,
     pushed_bytes: Arc<AtomicUsize>,
     last_progress_ms: Arc<AtomicU64>,
     start_instant: tokio::time::Instant,
@@ -158,10 +157,6 @@ impl Stream for InMemoryUploadStream {
         if let Some(stats) = &self.stats {
             stats
                 .up_bytes_body_yielded
-                .fetch_add(to_send as u64, Ordering::Relaxed);
-        }
-        if let Some(nm) = &self.node_metrics {
-            nm.bytes_client
                 .fetch_add(to_send as u64, Ordering::Relaxed);
         }
         self.pushed_bytes.fetch_add(to_send, Ordering::Relaxed);
@@ -228,7 +223,6 @@ async fn probe_and_rank_upload_targets(
                     offset: 0,
                     remaining: probe_len,
                     stats: None,
-                    node_metrics: None,
                     pushed_bytes: pushed.clone(),
                     last_progress_ms: lp,
                     start_instant: tokio::time::Instant::now(),
@@ -691,7 +685,6 @@ pub async fn run_upload_test(
                     offset: 0,
                     remaining: http_post_size,
                     stats: Some(stats.clone()),
-                    node_metrics: Some(node.metrics.clone()),
                     pushed_bytes: pushed.clone(),
                     last_progress_ms: last_progress_ms.clone(),
                     start_instant,
