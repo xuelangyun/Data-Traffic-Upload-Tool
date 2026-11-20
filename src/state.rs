@@ -144,6 +144,7 @@ pub struct TargetMetrics {
 
     pub rtt_sum_ms: AtomicU64,
     pub rtt_cnt: AtomicU64,
+    pub egress_map: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl TargetMetrics {
@@ -166,6 +167,7 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
+            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,6 +190,7 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
+            egress_map: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -227,6 +230,27 @@ impl TargetMetrics {
         } else {
             (self.orig_success.load(Ordering::Relaxed) as f64) * 100.0 / (att as f64)
         }
+    }
+
+    pub fn record_egress(&self, local_ip: String) {
+        if local_ip.is_empty() || local_ip=="0.0.0.0" { return; }
+        let mut m = self.egress_map.lock();
+        *m.entry(local_ip).or_insert(0) += 1;
+    }
+    pub fn egress_summary(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        let top = v.into_iter().take(2).map(|(ip,c)| format!("{}({})", ip, c)).collect::<Vec<_>>().join(",");
+        top
+    }
+    pub fn egress_primary_ip(&self) -> String {
+        let m = self.egress_map.lock();
+        if m.is_empty() { return "-".to_string(); }
+        let mut v: Vec<(&String, &usize)> = m.iter().collect();
+        v.sort_by(|a,b| b.1.cmp(a.1));
+        v[0].0.clone()
     }
 }
 
@@ -394,6 +418,7 @@ impl NodeSpeedMetrics {
 pub struct WanRow {
     pub label: String,
     pub resolved: String,
+    pub egress_ip: String,
     pub active: usize,
     pub peak: usize,
     pub pct: f64,
@@ -786,9 +811,11 @@ impl SharedStats {
             let pct = t.orig_success_rate_pct();
             let rtt = t.avg_rtt_ms();
             let share = (peak as f64)*100.0/(total_peak as f64);
+            let egress_ip = t.egress_primary_ip();
             WanRow {
                 label: t.label.clone(),
                 resolved: t.resolved_addr.clone(),
+                egress_ip,
                 active: act,
                 peak,
                 pct,

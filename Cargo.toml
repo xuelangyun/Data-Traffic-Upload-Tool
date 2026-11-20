@@ -15,6 +15,7 @@ futures-core = "0.3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", features = [
+    "commctrl",
     "iphlpapi",
     "libloaderapi",
     "netioapi",
