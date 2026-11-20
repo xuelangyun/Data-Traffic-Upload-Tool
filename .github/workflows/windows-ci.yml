@@ -1,0 +1,47 @@
+name: Windows CI
+
+on:
+  push:
+    branches: ["main", "arena/*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        continue-on-error: true
+        run: cargo clippy --all-targets
+
+      - name: Run unit tests
+        run: cargo test --all-targets
+
+      - name: Build release binary
+        shell: pwsh
+        run: |
+          if (Test-Path Cargo.lock) {
+            cargo build --release --locked
+          } else {
+            cargo build --release
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: win_net_stress-windows-x86_64
+          path: target/release/win_net_stress.exe
