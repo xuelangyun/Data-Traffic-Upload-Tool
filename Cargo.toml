@@ -14,7 +14,7 @@ parking_lot = "0.12"
 futures-core = "0.3"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.100", features = [
+windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", features = [
     "iphlpapi",
     "libloaderapi",
     "processthreadsapi",
