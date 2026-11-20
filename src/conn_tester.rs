@@ -661,7 +661,7 @@ fn next_step_size(current: usize) -> usize {
     }
 }
 
-fn log_wan_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str) {
+fn log_target_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str) {
     let snapshot: Vec<Arc<TargetMetrics>> = stats.target_metrics.lock().clone();
     if snapshot.is_empty() {
         return;
@@ -909,10 +909,10 @@ pub async fn run_conn_test(
             }
 
             if hold_elapsed.is_multiple_of(10) {
-                log_wan_distribution_table(
+                log_target_distribution_table(
                     &stats,
                     &log,
-                    &format!("[WAN 分布周期采样 @ 保持 {hold_elapsed}s] 各健康目标实况:"),
+                    &format!("[远端目标分布周期采样 @ 保持 {hold_elapsed}s] 各健康远端目标实况:"),
                 );
             }
 
@@ -948,10 +948,10 @@ pub async fn run_conn_test(
     }
 
     // Final WAN snapshot while sockets or peaks are intact before teardown
-    log_wan_distribution_table(
+    log_target_distribution_table(
         &stats,
         &log,
-        "[多目标 WAN 分布明细]（注：单条 TCP 连接通常仅走单条 WAN 出口，多目标高并发才会分散至多条线路）",
+        "[远端目标连接分布明细]（注：此处统计远端目标连接分布，不代表物理 WAN 口分布）",
     );
 
     for tok in pool.drain(..) {
