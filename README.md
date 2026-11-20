@@ -8,7 +8,7 @@
    - 禁止 `std::fs`、不生成配置文件、不写日志文件、不写临时文件、不修改注册表。
    - 预生成 1 MiB 不可压缩随机内存载荷（xorshift64*）供多流复用；日志采用内存环形缓冲（最多保留 400 条）。
 2. **原生 Win32 API 界面**
-   - 直接基于官方 `windows` crate 调用 Win32 窗口、控件、DPI 感知、`SetTimer` 刷新和 `iphlpapi` / `GetProcessHandleCount` 系统指标，无重型前端运行时。
+   - 直接基于官方 `microsoft/windows-rs` 最新版（`windows = 0.100.0`，tag `74`）调用 Win32 窗口、控件、DPI 感知、`SetTimer` 刷新和 `iphlpapi` / `GetProcessHandleCount` 系统指标，无重型前端运行时。
 3. **三大测试模块**
    - **最大并发 TCP 连接数探测 (`ConnTester`)**：使用 `tokio::net::TcpSocket` + `socket2` TCP Keepalive，按阶梯递增 + 稳定观察窗口 + 二分收敛探测最大稳定并发连接数，并分类统计超时、拒绝/重置、系统端口/缓冲区资源受限等失败原因。
    - **持续上行带宽压测 (`BandwidthUploader`)**：支持 HTTP/HTTPS POST 流式上传（含 413 自适应分片）及 `tcp://ip:port` 原始 TCP 持续发送。

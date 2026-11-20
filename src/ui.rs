@@ -920,7 +920,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
     };
 
     let atom = unsafe { RegisterClassExW(&wc) };
-    if atom == 0 {
+    if atom.0 == 0 {
         return Err("RegisterClassExW failed".to_string());
     }
 
