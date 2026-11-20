@@ -25,6 +25,7 @@ windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", feature
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
+panic = "abort"
 strip = "symbols"

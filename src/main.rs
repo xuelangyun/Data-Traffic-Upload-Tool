@@ -34,13 +34,7 @@ fn main() {
     #[cfg(windows)]
     {
         let state = Arc::new(AppState::default());
-        let engine = match EngineHandle::new(state.clone()) {
-            Ok(e) => e,
-            Err(err) => {
-                show_fatal_error(&err);
-                std::process::exit(1);
-            }
-        };
+        let engine = EngineHandle::new(state.clone());
 
         if let Err(err) = ui::run_gui(state, engine) {
             show_fatal_error(&err);
