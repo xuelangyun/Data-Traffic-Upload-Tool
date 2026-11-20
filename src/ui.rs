@@ -1093,7 +1093,7 @@ impl UiState {
         unsafe { set_cached_text(self.lbl_up_row, &mut self.cache.up_row, up_row) };
 
         let up_detail = format!(
-            "  └ 累计确认:{} | 延迟:{up_lat}ms | 重传:{retrans_pct:.2}% | NIC上行:{}",
+            "  └ HTTP 2xx 接受量:{} | 延迟:{up_lat}ms | 系统 IPv4 TCP 重传率:{retrans_pct:.2}% | 物理网卡上行:{}",
             format_bytes(up_total),
             format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
         );
@@ -1192,8 +1192,8 @@ impl UiState {
                 if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
             }
         };
-        let wan_ip_text = format!("公网出口 IP 抽样（不同探测目标；不等同 WAN 线路）: {}{}", egress_ip_disp, egress_ip_age);
-        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_ip_text) };
+        let egress_ip_text = format!("公网出口 IP 抽样（按独立探测目标；不等同 WAN 线路）: {}{}", egress_ip_disp, egress_ip_age);
+        unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
         let wan_header_text = "  序号  远端目标                     存活/峰值   建连成功率 RTT 当前占比".to_string();
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
@@ -1204,7 +1204,8 @@ impl UiState {
                 let r = &target_rows[idx];
                 // Format aligned columns: use fixed-width like formatting
                 // e.g., " ① 223.5.5.5:443 (223.5.5.5)    12/45  98.1%  14ms  31.2%"
-                let label_disp: String = r.label.chars().take(22).collect();
+                let target_label = format!("{} ({})", r.label, r.resolved);
+                let label_disp: String = target_label.chars().take(22).collect();
                 format!("  {:>2}. {:<24} {:>3}/{:<3}  {:>5.1}%  {:>3}ms  {:>4.1}%",
                     idx+1, label_disp, r.active, r.peak, r.pct, r.rtt, r.share)
             } else {
@@ -2430,7 +2431,7 @@ unsafe extern "system" fn wnd_proc(
                             "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
                             "4. 出口识别：表格展示的是远端目标连接分布，不是 WAN1/WAN2 实际端口分布；公网 IP 抽样按不同探测目标独立采集，也不能单独证明 WAN 线路映射。要确认物理 WAN 流量，需要读取路由器接口计数器或 SNMP。\n\n",
                             "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
-                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样物理网卡收发字节、名称、状态、链路速率，避免将虚拟接口重复叠加，并显示 TCP 重传率与 RTT/失败率。\n\n",
+                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 汇总物理网卡流量并排除虚拟接口；系统 IPv4 TCP 重传率按采样增量计算。\n\n",
                             "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
                         );
                         let wide = to_wide_null(help_text);
