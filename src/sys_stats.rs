@@ -13,17 +13,36 @@ pub struct SysSnapshot {
     pub nic_summary: String,
 }
 
+/// Return the sampled IPv4 TCP retransmission percentage multiplied by 100.
+/// For example, 1.25% is represented as 125.
+fn retransmission_pct_x100(delta_out_segments: u64, delta_retrans_segments: u64) -> u32 {
+    if delta_out_segments == 0 {
+        0
+    } else {
+        ((delta_retrans_segments as f64 * 10_000.0 / delta_out_segments as f64)
+            .round()
+            .clamp(0.0, u32::MAX as f64)) as u32
+    }
+}
+
 #[cfg(windows)]
 mod win_imp {
-    use super::SysSnapshot;
+    use super::{retransmission_pct_x100, SysSnapshot};
     use std::sync::Mutex;
     use std::time::Instant;
     // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
     use windows::Win32::iphlpapi::GetTcpStatistics;
     use windows::Win32::netioapi::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
     use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
-    use windows::Win32::sysinfoapi::GetLocalTime;
     use windows::Win32::tcpmib::MIB_TCPSTATS_LH;
+
+    struct TcpCounterState {
+        last_sample: Instant,
+        out_segments: u32,
+        retrans_segments: u32,
+    }
+
+    static TCP_COUNTER_STATE: Mutex<Option<TcpCounterState>> = Mutex::new(None);
 
     struct NicState {
         last_sample: Instant,
@@ -45,13 +64,8 @@ mod win_imp {
 
     pub fn query_sys_snapshot() -> SysSnapshot {
         let mut tcp_stats = MIB_TCPSTATS_LH::default();
-        let tcp_estab = unsafe {
-            if GetTcpStatistics(&mut tcp_stats) == 0 {
-                tcp_stats.dwCurrEstab
-            } else {
-                0
-            }
-        };
+        let tcp_ok = unsafe { GetTcpStatistics(&mut tcp_stats) == 0 };
+        let tcp_estab = if tcp_ok { tcp_stats.dwCurrEstab } else { 0 };
 
         let mut handles: u32 = 0;
         unsafe {
@@ -59,14 +73,12 @@ mod win_imp {
             let _ = GetProcessHandleCount(proc_handle, &mut handles);
         }
 
-        let retrans_pct_x100 = {
-            let out = tcp_stats.dwOutSegs as u64;
-            let retrans = tcp_stats.dwRetransSegs as u64;
-            if out > 0 {
-                ((retrans as f64) * 10000.0 / (out as f64)).round() as u32
-            } else {
-                0
-            }
+        // GetTcpStatistics counters are cumulative. Calculate the ratio from the
+        // delta between samples, not from the lifetime totals.
+        let retrans_pct_x100 = if tcp_ok {
+            sample_tcp_retransmission_pct(tcp_stats.dwOutSegs, tcp_stats.dwRetransSegs)
+        } else {
+            0
         };
 
         // Sample NICs via GetIfTable2
@@ -84,6 +96,29 @@ mod win_imp {
         }
     }
 
+    fn sample_tcp_retransmission_pct(out_segments: u32, retrans_segments: u32) -> u32 {
+        let now = Instant::now();
+        let mut guard = TCP_COUNTER_STATE.lock().unwrap();
+        let result = if let Some(previous) = guard.as_ref() {
+            let elapsed = now.duration_since(previous.last_sample).as_secs_f64();
+            if elapsed >= 0.2 {
+                let delta_out = out_segments.wrapping_sub(previous.out_segments) as u64;
+                let delta_retrans = retrans_segments.wrapping_sub(previous.retrans_segments) as u64;
+                retransmission_pct_x100(delta_out, delta_retrans)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        *guard = Some(TcpCounterState {
+            last_sample: now,
+            out_segments,
+            retrans_segments,
+        });
+        result
+    }
+
     fn sample_nics() -> (u64, u64, String, u64, u64) {
         let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
         let rc = unsafe { GetIfTable2(&mut table_ptr) };
@@ -96,13 +131,19 @@ mod win_imp {
 
         let mut tx_total: u64 = 0;
         let mut rx_total: u64 = 0;
-        let mut rows: Vec<(String, u64, u64, u64)> = Vec::new(); // (name, tx, rx, linkSpeed)
+        let mut rows: Vec<(String, u64, u64, u64)> = Vec::new(); // physical adapters only: (name, tx, rx, linkSpeed)
+        let mut virtual_adapters = 0usize;
 
         for i in 0..num {
             let row: &MIB_IF_ROW2 = unsafe { &*table.Table.as_ptr().add(i) };
             let is_loopback = row.Type.0 == 24;
             let has_mac = row.PhysicalAddressLength > 0;
+            let is_hardware = row.InterfaceAndOperStatusFlags._bitfield;
             if is_loopback || !has_mac {
+                continue;
+            }
+            if !is_hardware {
+                virtual_adapters += 1;
                 continue;
             }
 
@@ -124,7 +165,7 @@ mod win_imp {
         unsafe { FreeMibTable(table_ptr as *const _) };
 
         if rows.is_empty() {
-            return (tx_total, rx_total, "未检测到活动物理网卡".to_string(), 0, 0);
+            return (tx_total, rx_total, "未检测到物理网卡接口".to_string(), 0, 0);
         }
 
         // Compute BPS via delta with EMA smoothing
@@ -169,7 +210,7 @@ mod win_imp {
         };
 
         // Build human-readable summary
-        rows.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
+        rows.sort_by(|a, b| b.1.saturating_add(b.2).cmp(&a.1.saturating_add(a.2)));
         let mut parts: Vec<String> = Vec::new();
         for (name, _tx, _rx, link) in rows.iter().take(3) {
             let link_str = if *link >= 1_000_000 {
@@ -184,7 +225,10 @@ mod win_imp {
         if rows.len() > 3 {
             parts.push(format!("等{}块网卡", rows.len()));
         }
-        let summary = parts.join(" · ");
+        let mut summary = format!("物理网卡汇总（不含虚拟接口）: {}", parts.join(" · "));
+        if virtual_adapters > 0 {
+            summary.push_str(&format!(" · 已排除 {virtual_adapters} 个虚拟/软件接口，避免重复计数"));
+        }
 
         // Store updated BPS back
         if let Some(st) = guard.as_mut() {
@@ -230,6 +274,18 @@ mod win_imp {
 
 #[cfg(windows)]
 pub use win_imp::{query_egress_local_ips, query_sys_snapshot};
+
+#[cfg(test)]
+mod tests {
+    use super::retransmission_pct_x100;
+
+    #[test]
+    fn retransmission_rate_uses_interval_deltas() {
+        assert_eq!(retransmission_pct_x100(10_000, 125), 125);
+        assert_eq!(retransmission_pct_x100(0, 100), 0);
+        assert_eq!(retransmission_pct_x100(100, 0), 0);
+    }
+}
 
 #[cfg(not(windows))]
 pub fn query_sys_snapshot() -> SysSnapshot {

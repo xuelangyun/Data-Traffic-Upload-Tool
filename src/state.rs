@@ -802,7 +802,7 @@ impl SharedStats {
         if healthy.is_empty() {
             return Vec::new();
         }
-        let total_peak: usize = healthy.iter().map(|t| t.peak_conns.load(Ordering::Relaxed)).sum::<usize>().max(1);
+        let total_active: usize = healthy.iter().map(|t| t.active_conns.load(Ordering::Relaxed)).sum();
         let mut sorted = healthy;
         sorted.sort_by(|a,b| b.active_conns.load(Ordering::Relaxed).cmp(&a.active_conns.load(Ordering::Relaxed)));
         sorted.iter().take(8).map(|t| {
@@ -810,7 +810,7 @@ impl SharedStats {
             let peak = t.peak_conns.load(Ordering::Relaxed);
             let pct = t.orig_success_rate_pct();
             let rtt = t.avg_rtt_ms();
-            let share = (peak as f64)*100.0/(total_peak as f64);
+            let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
             let egress_ip = t.egress_primary_ip();
             WanRow {
                 label: t.label.clone(),

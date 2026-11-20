@@ -665,18 +665,17 @@ fn next_step_size(current: usize) -> usize {
     }
 }
 
-fn log_wan_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str) {
+fn log_target_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str) {
     let snapshot: Vec<Arc<TargetMetrics>> = stats.target_metrics.lock().clone();
     if snapshot.is_empty() {
         return;
     }
     log.push(header);
-    let total_peak: usize = snapshot
+    let total_active: usize = snapshot
         .iter()
         .filter(|t| t.healthy)
-        .map(|t| t.peak_conns.load(Ordering::Relaxed))
-        .sum::<usize>()
-        .max(1);
+        .map(|t| t.active_conns.load(Ordering::Relaxed))
+        .sum();
 
     for t in &snapshot {
         if !t.healthy {
@@ -684,7 +683,7 @@ fn log_wan_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str
         }
         let act = t.active_conns.load(Ordering::Relaxed);
         let pk = t.peak_conns.load(Ordering::Relaxed);
-        let share = (pk as f64) * 100.0 / (total_peak as f64);
+        let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
         let orig_ok = t.orig_success.load(Ordering::Relaxed);
         let orig_att = t.orig_attempts.load(Ordering::Relaxed);
         let orig_pct = t.orig_success_rate_pct();
@@ -696,7 +695,7 @@ fn log_wan_distribution_table(stats: &SharedStats, log: &MemoryLog, header: &str
         let f_to = t.fail_timeout.load(Ordering::Relaxed);
         let avg_rtt = t.avg_rtt_ms();
         log.push(format!(
-            "  · {} [{}] | 存活/峰值:{act}/{pk} (占比{share:.1}%) | 原始:{orig_ok}/{orig_att}({orig_pct:.1}%) | 补建:{rep_ok}/{rep_att} | 归属(本机:{f_loc} 拒:{f_ref} 远闭:{f_rem} 超时:{f_to}) | RTT:{avg_rtt}ms",
+            "  · {} [{}] | 存活/峰值:{act}/{pk} (当前存活占比{share:.1}%) | 原始:{orig_ok}/{orig_att}({orig_pct:.1}%) | 补建:{rep_ok}/{rep_att} | 归属(本机:{f_loc} 拒:{f_ref} 远闭:{f_rem} 超时:{f_to}) | RTT:{avg_rtt}ms",
             t.label, t.resolved_addr
         ));
     }
@@ -913,10 +912,10 @@ pub async fn run_conn_test(
             }
 
             if hold_elapsed.is_multiple_of(10) {
-                log_wan_distribution_table(
+                log_target_distribution_table(
                     &stats,
                     &log,
-                    &format!("[WAN 分布周期采样 @ 保持 {hold_elapsed}s] 各健康目标实况:"),
+                    &format!("[远端目标分布周期采样 @ 保持 {hold_elapsed}s] 各健康远端目标实况:"),
                 );
             }
 
@@ -951,11 +950,11 @@ pub async fn run_conn_test(
         stats.conn_holding.store(false, Ordering::Relaxed);
     }
 
-    // Final WAN snapshot while sockets or peaks are intact before teardown
-    log_wan_distribution_table(
+    // Final remote-target snapshot while sockets or peaks are intact before teardown
+    log_target_distribution_table(
         &stats,
         &log,
-        "[多目标 WAN 分布明细]（注：单条 TCP 连接通常仅走单条 WAN 出口，多目标高并发才会分散至多条线路）",
+        "[远端目标连接分布明细]（注：此处统计远端目标连接分布，不代表物理 WAN 口分布）",
     );
 
     for tok in pool.drain(..) {
