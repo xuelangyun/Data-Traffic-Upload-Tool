@@ -1,4 +1,4 @@
-//! High-accuracy, multi-WAN HTTP/1.1 upload bandwidth tester.
+//! HTTP/1.1 upload bandwidth tester with explicit HTTP acceptance accounting.
 //! Key guarantees:
 //! 1. Separates bytes yielded into the HTTP body stream from complete HTTP 2xx request outcomes.
 //!    HTTP 2xx is not a byte-level server receipt acknowledgement.
