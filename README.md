@@ -17,7 +17,7 @@
 
 ## Windows 程序图标
 
-- 正式 EXE 使用 `assets/winnetstress.ico` 多分辨率图标（16/32/48/256 px）。
+- 正式 EXE 使用 `build.rs` 生成的多分辨率网络测速图标（16/32/48/128 px），包含测速表盘、上行指针和网络地球元素。
 - Windows MSVC 构建通过 Windows SDK `rc.exe` 将图标作为 PE 资源嵌入；若图标资源无法编译，构建会直接失败，不再静默退回默认图标。
 
 ## 软件截图
