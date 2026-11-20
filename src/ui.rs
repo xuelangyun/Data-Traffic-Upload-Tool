@@ -24,6 +24,7 @@ const ID_BTN_CLEAR_LOG: usize = 1006;
 const ID_BTN_HELP: usize = 1007;
 const ID_CHK_CONTINUOUS: usize = 1008;
 const ID_TIMER_REFRESH: usize = 2001;
+const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
 // Classic Win32 Edit control messages omitted from windows crate UI bindings.
 const EM_SETSEL: u32 = 0x00B1;
@@ -68,13 +69,8 @@ struct ThemeResources {
 impl ThemeResources {
     unsafe fn create(dpi: u32) -> Self {
         let safe_dpi = dpi.max(96);
-        let font_title = unsafe { create_ui_font("Microsoft YaHei UI", 11, FW_BOLD, safe_dpi) };
-        let font_ui = unsafe { create_ui_font("Microsoft YaHei UI", 9, FW_NORMAL, safe_dpi) };
-        let font_bold = unsafe { create_ui_font("Microsoft YaHei UI", 9, FW_SEMIBOLD, safe_dpi) };
-        let font_mono = unsafe { create_ui_font("Consolas", 9, FW_NORMAL, safe_dpi) };
-
-        let line_h = unsafe { measure_font_height(font_ui, safe_dpi) };
-        let title_h = unsafe { measure_font_height(font_title, safe_dpi) };
+        let (font_title, font_ui, font_bold, font_mono, line_h, title_h) =
+            unsafe { create_font_bundle(safe_dpi) };
         let brush_bg = unsafe { CreateSolidBrush(COLOR_BG) };
         let brush_card = unsafe { CreateSolidBrush(COLOR_CARD) };
 
@@ -99,13 +95,15 @@ impl ThemeResources {
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_mono);
         }
+        let (font_title, font_ui, font_bold, font_mono, line_h, title_h) =
+            unsafe { create_font_bundle(safe_dpi) };
         self.dpi = safe_dpi;
-        self.font_title = unsafe { create_ui_font("Microsoft YaHei UI", 11, FW_BOLD, safe_dpi) };
-        self.font_ui = unsafe { create_ui_font("Microsoft YaHei UI", 9, FW_NORMAL, safe_dpi) };
-        self.font_bold = unsafe { create_ui_font("Microsoft YaHei UI", 9, FW_SEMIBOLD, safe_dpi) };
-        self.font_mono = unsafe { create_ui_font("Consolas", 9, FW_NORMAL, safe_dpi) };
-        self.line_h = unsafe { measure_font_height(self.font_ui, safe_dpi) };
-        self.title_h = unsafe { measure_font_height(self.font_title, safe_dpi) };
+        self.font_title = font_title;
+        self.font_ui = font_ui;
+        self.font_bold = font_bold;
+        self.font_mono = font_mono;
+        self.line_h = line_h;
+        self.title_h = title_h;
     }
 
     unsafe fn destroy(&mut self) {
@@ -133,17 +131,32 @@ unsafe fn delete_font(font: &mut HFONT) {
     }
 }
 
-unsafe fn create_ui_font(face: &str, pt_size: i32, weight: i32, dpi: u32) -> HFONT {
+unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32) {
     let hdc = unsafe { GetDC(None) };
     let log_y = if !hdc.0.is_null() {
         let y = unsafe { GetDeviceCaps(Some(hdc), LOGPIXELSY) };
-        let _ = unsafe { ReleaseDC(None, hdc) };
         if y > 0 { y } else { dpi as i32 }
     } else {
         dpi as i32
     };
     let effective_dpi = dpi.max(log_y.max(96) as u32) as i32;
 
+    let font_title = create_ui_font("Microsoft YaHei UI", 11, FW_BOLD, effective_dpi);
+    let font_ui = create_ui_font("Microsoft YaHei UI", 9, FW_NORMAL, effective_dpi);
+    let font_bold = create_ui_font("Microsoft YaHei UI", 9, FW_SEMIBOLD, effective_dpi);
+    let font_mono = create_ui_font("Consolas", 9, FW_NORMAL, effective_dpi);
+
+    let line_h = unsafe { measure_font_height_dc(hdc, font_ui, dpi) };
+    let title_h = unsafe { measure_font_height_dc(hdc, font_title, dpi) };
+
+    if !hdc.0.is_null() {
+        let _ = unsafe { ReleaseDC(None, hdc) };
+    }
+
+    (font_title, font_ui, font_bold, font_mono, line_h, title_h)
+}
+
+fn create_ui_font(face: &str, pt_size: i32, weight: i32, effective_dpi: i32) -> HFONT {
     let mut lf = LOGFONTW {
         lfHeight: -((pt_size * effective_dpi) / 72),
         lfWeight: weight,
@@ -160,9 +173,8 @@ unsafe fn create_ui_font(face: &str, pt_size: i32, weight: i32, dpi: u32) -> HFO
     unsafe { CreateFontIndirectW(&lf) }
 }
 
-unsafe fn measure_font_height(font: HFONT, dpi: u32) -> i32 {
+unsafe fn measure_font_height_dc(hdc: HDC, font: HFONT, dpi: u32) -> i32 {
     let fallback = scale_px(18, dpi);
-    let hdc = unsafe { GetDC(None) };
     if hdc.0.is_null() {
         return fallback;
     }
@@ -170,7 +182,6 @@ unsafe fn measure_font_height(font: HFONT, dpi: u32) -> i32 {
     let mut tm = TEXTMETRICW::default();
     let ok = unsafe { GetTextMetricsW(hdc, &mut tm) }.as_bool();
     let _ = unsafe { SelectObject(hdc, prev) };
-    let _ = unsafe { ReleaseDC(None, hdc) };
     if ok && tm.tmHeight > 0 {
         tm.tmHeight
     } else {
@@ -784,6 +795,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
 
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
+        let _ = PostMessageW(Some(hwnd), WM_APP_WARMUP, WPARAM(0), LPARAM(0));
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1371,6 +1383,14 @@ unsafe extern "system" fn wnd_proc(
                 let w = (lparam.0 & 0xFFFF) as i32;
                 let h = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 unsafe { ui.layout(w, h) };
+            }
+            LRESULT(0)
+        }
+        m if m == WM_APP_WARMUP => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
+            if !ptr.is_null() {
+                let ui = unsafe { &*ptr };
+                ui.engine.warm_up();
             }
             LRESULT(0)
         }
