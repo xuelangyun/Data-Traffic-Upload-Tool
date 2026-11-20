@@ -27,14 +27,13 @@ fn retransmission_pct_x100(delta_out_segments: u64, delta_retrans_segments: u64)
 
 #[cfg(windows)]
 mod win_imp {
-    use super::SysSnapshot;
+    use super::{retransmission_pct_x100, SysSnapshot};
     use std::sync::Mutex;
     use std::time::Instant;
     // In windows-rs 0.100.0 (tag 74) these live directly under Win32::iphlpapi / sysinfoapi
     use windows::Win32::iphlpapi::GetTcpStatistics;
     use windows::Win32::netioapi::{FreeMibTable, GetIfTable2, MIB_IF_ROW2, MIB_IF_TABLE2};
     use windows::Win32::processthreadsapi::{GetCurrentProcess, GetProcessHandleCount};
-    use windows::Win32::sysinfoapi::GetLocalTime;
     use windows::Win32::tcpmib::MIB_TCPSTATS_LH;
 
     struct TcpCounterState {
@@ -139,7 +138,7 @@ mod win_imp {
             let row: &MIB_IF_ROW2 = unsafe { &*table.Table.as_ptr().add(i) };
             let is_loopback = row.Type.0 == 24;
             let has_mac = row.PhysicalAddressLength > 0;
-            let is_hardware = (row.InterfaceAndOperStatusFlags & 0x01) != 0;
+            let is_hardware = row.InterfaceAndOperStatusFlags._bitfield;
             if is_loopback || !has_mac {
                 continue;
             }
