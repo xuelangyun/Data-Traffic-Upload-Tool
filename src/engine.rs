@@ -378,9 +378,21 @@ fn init_runtime_once<'a>(
                         .await
                         .ok()?
                         .ok()?;
+                        if !response.status().is_success() {
+                            return None;
+                        }
                         let body = response.text().await.ok()?;
+                        if body.len() > 64 {
+                            return None;
+                        }
                         let ip = body.trim().parse::<std::net::IpAddr>().ok()?;
-                        let provider = url.split('/').nth(2).unwrap_or(url);
+                        let provider = url
+                            .split('/')
+                            .nth(2)
+                            .unwrap_or(url)
+                            .split('?')
+                            .next()
+                            .unwrap_or(url);
                         Some(EgressIpObservation {
                             provider: provider.to_string(),
                             ip: ip.to_string(),
