@@ -1097,6 +1097,68 @@ mod tests {
     }
 
     #[test]
+    fn egress_active_counts_are_released_without_losing_observations() {
+        let target = TargetMetrics::healthy("test".to_string(), "203.0.113.10:443".to_string(), 10);
+        target.record_egress_connected("192.168.1.20".to_string());
+        target.record_egress_connected("192.168.1.20".to_string());
+        target.record_egress_connected("0.0.0.0".to_string());
+        target.record_egress_connected("127.0.0.1".to_string());
+
+        assert_eq!(target.egress_active.lock().get("192.168.1.20"), Some(&2));
+        assert_eq!(target.egress_map.lock().get("192.168.1.20"), Some(&2));
+        assert_eq!(target.egress_map.lock().len(), 1);
+
+        target.release_egress("192.168.1.20");
+        assert_eq!(target.egress_active.lock().get("192.168.1.20"), Some(&1));
+        target.release_egress("192.168.1.20");
+        assert!(target.egress_active.lock().is_empty());
+        assert_eq!(target.egress_map.lock().get("192.168.1.20"), Some(&2));
+    }
+
+    #[test]
+    fn wan_rows_group_the_same_local_source_ip_and_sort_by_active_connections() {
+        let stats = SharedStats::default();
+        let first = Arc::new(TargetMetrics::healthy(
+            "target-a".to_string(),
+            "203.0.113.1:443".to_string(),
+            12,
+        ));
+        let second = Arc::new(TargetMetrics::healthy(
+            "target-b".to_string(),
+            "203.0.113.2:443".to_string(),
+            18,
+        ));
+        let third = Arc::new(TargetMetrics::healthy(
+            "target-c".to_string(),
+            "203.0.113.3:443".to_string(),
+            24,
+        ));
+
+        first.record_egress_connected("192.168.1.20".to_string());
+        first.active_conns.store(1, Ordering::Relaxed);
+        second.record_egress_connected("192.168.1.20".to_string());
+        second.record_egress_connected("192.168.1.20".to_string());
+        second.active_conns.store(2, Ordering::Relaxed);
+        third.record_egress_connected("192.168.1.21".to_string());
+        third.active_conns.store(1, Ordering::Relaxed);
+        stats.target_metrics.lock().extend([first.clone(), second, third]);
+
+        let rows = stats.wan_vertical_rows();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].egress_ip, "192.168.1.20");
+        assert_eq!(rows[1].egress_ip, "192.168.1.20");
+        assert_eq!(rows[2].egress_ip, "192.168.1.21");
+        assert_eq!(rows[0].active + rows[1].active, 3);
+        assert!((rows[0].share + rows[1].share + rows[2].share - 100.0).abs() < 0.001);
+
+        first.release_egress("192.168.1.20");
+        first.active_conns.store(0, Ordering::Relaxed);
+        let active_rows = stats.wan_vertical_rows();
+        assert_eq!(active_rows.len(), 2);
+        assert_eq!(active_rows[0].egress_ip, "192.168.1.20");
+    }
+
+    #[test]
     fn test_compute_p95_and_median() {
         let vals: Vec<u64> = (1..=20).collect();
         assert_eq!(compute_p95(&vals), 19);
