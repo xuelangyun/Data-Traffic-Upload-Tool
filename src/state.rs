@@ -256,7 +256,7 @@ pub struct NodeSpeedMetrics {
     pub url: String,
     pub probe_bps: AtomicU64,
     pub ema_bps: AtomicU64,
-    pub bytes_http_accepted: AtomicU64,
+    pub bytes_succeeded: AtomicU64,
     pub requests_ok: AtomicU64,
     pub requests_fail: AtomicU64,
     pub consecutive_fails: AtomicU32,
@@ -296,7 +296,7 @@ impl NodeSpeedMetrics {
             url,
             probe_bps: AtomicU64::new(probe_bps),
             ema_bps: AtomicU64::new(probe_bps),
-            bytes_http_accepted: AtomicU64::new(0),
+            bytes_succeeded: AtomicU64::new(0),
             requests_ok: AtomicU64::new(0),
             requests_fail: AtomicU64::new(0),
             consecutive_fails: AtomicU32::new(0),
@@ -316,16 +316,16 @@ impl NodeSpeedMetrics {
         }
     }
 
-    pub fn record_success(&self, http_accepted_bytes: u64, elapsed_ms: u64) {
-        self.bytes_http_accepted
-            .fetch_add(http_accepted_bytes, Ordering::Relaxed);
+    pub fn record_success(&self, successful_bytes: u64, elapsed_ms: u64) {
+        self.bytes_succeeded
+            .fetch_add(successful_bytes, Ordering::Relaxed);
         self.requests_ok.fetch_add(1, Ordering::Relaxed);
         self.consecutive_fails.store(0, Ordering::Relaxed);
         self.latency_sum_ms
             .fetch_add(elapsed_ms.max(1), Ordering::Relaxed);
         self.latency_cnt.fetch_add(1, Ordering::Relaxed);
 
-        let bps = ((http_accepted_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
+        let bps = ((successful_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
         let prev = self.ema_bps.load(Ordering::Relaxed);
         let next = if prev == 0 {
             bps
