@@ -1,0 +1,30 @@
+[package]
+name = "win_net_stress"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.96"
+description = "Pure in-memory native Windows (Win32 API) public network connection & bandwidth stress tester"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+socket2 = { version = "0.5", features = ["all"] }
+bytes = "1"
+parking_lot = "0.12"
+futures-core = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", features = [
+    "iphlpapi",
+    "libloaderapi",
+    "processthreadsapi",
+    "sysinfoapi",
+    "wingdi",
+    "winuser",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

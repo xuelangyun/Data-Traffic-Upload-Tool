@@ -1,0 +1,122 @@
+name: Build & Release Windows Binary
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (leave empty to use v<Cargo.toml version>)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark as prerelease"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Build & Publish (Windows x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version and tag
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -Raw Cargo.toml
+          if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
+            $cargoVersion = $Matches[1]
+          } else {
+            throw "Failed to parse version from Cargo.toml"
+          }
+
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+          } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.tag }}")) {
+            $tag = "${{ inputs.tag }}".Trim()
+          } else {
+            $tag = "v$cargoVersion"
+          }
+
+          $assetPrefix = "win_net_stress-$tag-windows-x86_64"
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ASSET_PREFIX=$assetPrefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Release Tag: $tag"
+          Write-Host "Asset Prefix: $assetPrefix"
+
+      - name: Run unit tests
+        run: cargo test --all-targets
+
+      - name: Build Windows release binary
+        shell: pwsh
+        run: |
+          if (Test-Path Cargo.lock) {
+            cargo build --release --locked --target x86_64-pc-windows-msvc
+          } else {
+            cargo build --release --target x86_64-pc-windows-msvc
+          }
+
+      - name: Package release archive and SHA256 checksums
+        shell: pwsh
+        run: |
+          $distDir = "dist"
+          $bundleDir = "$distDir/bundle"
+          New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
+
+          $srcExe = "target/x86_64-pc-windows-msvc/release/win_net_stress.exe"
+          if (-not (Test-Path $srcExe)) {
+            throw "Compiled binary not found: $srcExe"
+          }
+
+          $outExe = "$distDir/${env:ASSET_PREFIX}.exe"
+          $outZip = "$distDir/${env:ASSET_PREFIX}.zip"
+
+          Copy-Item $srcExe $outExe -Force
+          Copy-Item $srcExe "$bundleDir/win_net_stress.exe" -Force
+          Copy-Item "README.md" "$bundleDir/README.md" -Force
+
+          Compress-Archive -Path "$bundleDir/*" -DestinationPath $outZip -Force
+
+          $hashes = @()
+          foreach ($file in @($outExe, $outZip)) {
+            $h = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $name = Split-Path -Leaf $file
+            $hashes += "$h  $name"
+          }
+          $hashes | Out-File -FilePath "$distDir/SHA256SUMS.txt" -Encoding ascii
+          Get-Content "$distDir/SHA256SUMS.txt"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET_PREFIX }}
+          path: |
+            dist/*.zip
+            dist/*.exe
+            dist/SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: WinNetStress ${{ env.RELEASE_TAG }}
+          prerelease: ${{ (github.event_name == 'workflow_dispatch' && inputs.prerelease) || contains(env.RELEASE_TAG, '-') }}
+          generate_release_notes: true
+          files: |
+            dist/*.zip
+            dist/*.exe
+            dist/SHA256SUMS.txt
