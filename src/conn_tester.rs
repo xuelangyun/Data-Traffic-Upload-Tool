@@ -165,7 +165,9 @@ async fn probe_and_verify_targets(
     let mut resolve_set = JoinSet::new();
     for (idx, label) in unique_labels.iter().cloned().enumerate() {
         resolve_set.spawn(async move {
-            let res = tokio::time::timeout(Duration::from_secs(3), lookup_host(&label)).await;
+            let res = tokio::time::timeout(Duration::from_secs(3), lookup_host(label.as_str()))
+                .await
+                .map(|r| r.map(|iter| iter.collect::<Vec<_>>()));
             (idx, label, res)
         });
     }
