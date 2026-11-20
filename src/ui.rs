@@ -1,12 +1,13 @@
 //! Native Win32 GUI with zero-flicker GDI rendering, Per-Monitor DPI scaling,
-//! Common Controls v6 visual styling, and pure in-memory state updates.
+//! Windows system style & font adaptation, custom vector window icon, and pure
+//! in-memory state updates.
 
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use windows::Win32::*;
-use windows::core::{PCWSTR, PWSTR, w};
+use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 use crate::engine::EngineHandle;
 use crate::state::{
@@ -36,14 +37,6 @@ const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(((b as u32) << 16) | ((g as u32) << 8) | (r as u32))
 }
 
-const COLOR_BG: COLORREF = rgb(243, 245, 248); // #F3F5F8 soft slate canvas
-const COLOR_CARD: COLORREF = rgb(255, 255, 255); // #FFFFFF crisp input/log surface
-const COLOR_TEXT_PRIMARY: COLORREF = rgb(15, 23, 42); // #0F172A slate-900
-const COLOR_TEXT_MUTED: COLORREF = rgb(71, 85, 105); // #475569 slate-600
-const COLOR_BRAND: COLORREF = rgb(15, 76, 129); // #0F4C81 deep steel blue
-const COLOR_ACTIVE: COLORREF = rgb(5, 122, 85); // #057A55 emerald active state
-const COLOR_IDLE: COLORREF = rgb(3, 105, 161); // #0369A1 sky idle state
-
 #[derive(Default)]
 struct LabelCache {
     status: String,
@@ -54,6 +47,64 @@ struct LabelCache {
     down_row: String,
 }
 
+struct SystemColors {
+    bg: COLORREF,
+    card: COLORREF,
+    text_primary: COLORREF,
+    text_muted: COLORREF,
+    brand: COLORREF,
+    active: COLORREF,
+    idle: COLORREF,
+}
+
+impl SystemColors {
+    unsafe fn query() -> Self {
+        let bg = COLORREF(unsafe { GetSysColor(COLOR_BTNFACE) });
+        let card = COLORREF(unsafe { GetSysColor(COLOR_WINDOW) });
+        let text_primary = COLORREF(unsafe { GetSysColor(COLOR_WINDOWTEXT) });
+        let text_muted = COLORREF(unsafe { GetSysColor(COLOR_GRAYTEXT) });
+        let hotlight = COLORREF(unsafe { GetSysColor(COLOR_HOTLIGHT) });
+
+        // Compute relative luminance of card/bg to adapt status/brand colors cleanly
+        // even under high-contrast or dark-adapted system themes.
+        let bg_luma = color_luma(bg);
+        let brand = if hotlight.0 != 0 {
+            hotlight
+        } else if bg_luma < 128 {
+            rgb(96, 165, 250)
+        } else {
+            rgb(15, 76, 129)
+        };
+        let active = if bg_luma < 128 {
+            rgb(52, 211, 153)
+        } else {
+            rgb(5, 122, 85)
+        };
+        let idle = if bg_luma < 128 {
+            rgb(56, 189, 248)
+        } else {
+            rgb(3, 105, 161)
+        };
+
+        Self {
+            bg,
+            card,
+            text_primary,
+            text_muted,
+            brand,
+            active,
+            idle,
+        }
+    }
+}
+
+fn color_luma(c: COLORREF) -> u32 {
+    let r = c.0 & 0xFF;
+    let g = (c.0 >> 8) & 0xFF;
+    let b = (c.0 >> 16) & 0xFF;
+    (r * 299 + g * 587 + b * 114) / 1000
+}
+
 struct ThemeResources {
     dpi: u32,
     line_h: i32,
@@ -61,7 +112,8 @@ struct ThemeResources {
     font_title: HFONT,
     font_ui: HFONT,
     font_bold: HFONT,
-    font_mono: HFONT,
+    font_log: HFONT,
+    colors: SystemColors,
     brush_bg: HBRUSH,
     brush_card: HBRUSH,
 }
@@ -69,10 +121,11 @@ struct ThemeResources {
 impl ThemeResources {
     unsafe fn create(dpi: u32) -> Self {
         let safe_dpi = dpi.max(96);
-        let (font_title, font_ui, font_bold, font_mono, line_h, title_h) =
+        let (font_title, font_ui, font_bold, font_log, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
-        let brush_bg = unsafe { CreateSolidBrush(COLOR_BG) };
-        let brush_card = unsafe { CreateSolidBrush(COLOR_CARD) };
+        let colors = unsafe { SystemColors::query() };
+        let brush_bg = unsafe { CreateSolidBrush(colors.bg) };
+        let brush_card = unsafe { CreateSolidBrush(colors.card) };
 
         Self {
             dpi: safe_dpi,
@@ -81,7 +134,8 @@ impl ThemeResources {
             font_title,
             font_ui,
             font_bold,
-            font_mono,
+            font_log,
+            colors,
             brush_bg,
             brush_card,
         }
@@ -93,17 +147,29 @@ impl ThemeResources {
             delete_font(&mut self.font_title);
             delete_font(&mut self.font_ui);
             delete_font(&mut self.font_bold);
-            delete_font(&mut self.font_mono);
+            delete_font(&mut self.font_log);
         }
-        let (font_title, font_ui, font_bold, font_mono, line_h, title_h) =
+        let (font_title, font_ui, font_bold, font_log, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
         self.dpi = safe_dpi;
         self.font_title = font_title;
         self.font_ui = font_ui;
         self.font_bold = font_bold;
-        self.font_mono = font_mono;
+        self.font_log = font_log;
         self.line_h = line_h;
         self.title_h = title_h;
+    }
+
+    unsafe fn refresh_colors(&mut self) {
+        self.colors = unsafe { SystemColors::query() };
+        if !self.brush_bg.0.is_null() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(self.brush_bg.0)) };
+        }
+        if !self.brush_card.0.is_null() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(self.brush_card.0)) };
+        }
+        self.brush_bg = unsafe { CreateSolidBrush(self.colors.bg) };
+        self.brush_card = unsafe { CreateSolidBrush(self.colors.card) };
     }
 
     unsafe fn destroy(&mut self) {
@@ -111,7 +177,7 @@ impl ThemeResources {
             delete_font(&mut self.font_title);
             delete_font(&mut self.font_ui);
             delete_font(&mut self.font_bold);
-            delete_font(&mut self.font_mono);
+            delete_font(&mut self.font_log);
             if !self.brush_bg.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.brush_bg.0));
                 self.brush_bg = HBRUSH(std::ptr::null_mut());
@@ -133,18 +199,58 @@ unsafe fn delete_font(font: &mut HFONT) {
 
 unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32) {
     let hdc = unsafe { GetDC(None) };
-    let log_y = if !hdc.0.is_null() {
+    let sys_dpi = if !hdc.0.is_null() {
         let y = unsafe { GetDeviceCaps(Some(hdc), LOGPIXELSY) };
-        if y > 0 { y } else { dpi as i32 }
+        if y > 0 { y as u32 } else { 96 }
     } else {
-        dpi as i32
+        96
     };
-    let effective_dpi = dpi.max(log_y.max(96) as u32) as i32;
 
-    let font_title = create_ui_font("Microsoft YaHei UI", 11, FW_BOLD, effective_dpi);
-    let font_ui = create_ui_font("Microsoft YaHei UI", 9, FW_NORMAL, effective_dpi);
-    let font_bold = create_ui_font("Microsoft YaHei UI", 9, FW_SEMIBOLD, effective_dpi);
-    let font_mono = create_ui_font("Consolas", 9, FW_NORMAL, effective_dpi);
+    // Query the active Windows system UI font (e.g., Microsoft YaHei UI / Segoe UI).
+    let mut ncm = NONCLIENTMETRICSW {
+        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
+        ..Default::default()
+    };
+    let has_ncm = unsafe {
+        SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS as u32,
+            ncm.cbSize,
+            (&mut ncm as *mut NONCLIENTMETRICSW).cast::<c_void>(),
+            0,
+        )
+    }
+    .as_bool();
+
+    let mut base_lf = if has_ncm && ncm.lfMessageFont.lfFaceName[0] != 0 {
+        ncm.lfMessageFont
+    } else {
+        make_logfont("Microsoft YaHei UI", 9, FW_NORMAL, dpi as i32)
+    };
+
+    // Scale system message font to the target window DPI cleanly.
+    let raw_pt = if base_lf.lfHeight != 0 {
+        ((base_lf.lfHeight.unsigned_abs() * 72) + (sys_dpi / 2)) / sys_dpi
+    } else {
+        9
+    };
+    let base_pt = raw_pt.clamp(9, 12) as i32;
+
+    base_lf.lfQuality = CLEARTYPE_QUALITY as u8;
+    base_lf.lfHeight = -((base_pt * dpi as i32) / 72);
+    base_lf.lfWeight = FW_NORMAL;
+    let font_ui = unsafe { CreateFontIndirectW(&base_lf) };
+
+    let mut bold_lf = base_lf;
+    bold_lf.lfWeight = FW_SEMIBOLD;
+    let font_bold = unsafe { CreateFontIndirectW(&bold_lf) };
+
+    let mut title_lf = base_lf;
+    title_lf.lfHeight = -(((base_pt + 2) * dpi as i32) / 72);
+    title_lf.lfWeight = FW_BOLD;
+    let font_title = unsafe { CreateFontIndirectW(&title_lf) };
+
+    // Use the exact same system UI font for logs so Chinese & ASCII glyphs render uniformly.
+    let font_log = unsafe { CreateFontIndirectW(&base_lf) };
 
     let line_h = unsafe { measure_font_height_dc(hdc, font_ui, dpi) };
     let title_h = unsafe { measure_font_height_dc(hdc, font_title, dpi) };
@@ -153,10 +259,10 @@ unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32)
         let _ = unsafe { ReleaseDC(None, hdc) };
     }
 
-    (font_title, font_ui, font_bold, font_mono, line_h, title_h)
+    (font_title, font_ui, font_bold, font_log, line_h, title_h)
 }
 
-fn create_ui_font(face: &str, pt_size: i32, weight: i32, effective_dpi: i32) -> HFONT {
+fn make_logfont(face: &str, pt_size: i32, weight: i32, effective_dpi: i32) -> LOGFONTW {
     let mut lf = LOGFONTW {
         lfHeight: -((pt_size * effective_dpi) / 72),
         lfWeight: weight,
@@ -169,8 +275,7 @@ fn create_ui_font(face: &str, pt_size: i32, weight: i32, effective_dpi: i32) -> 
     let copy_len = wide.len().min(lf.lfFaceName.len() - 1);
     lf.lfFaceName[..copy_len].copy_from_slice(&wide[..copy_len]);
     lf.lfFaceName[copy_len] = 0;
-
-    unsafe { CreateFontIndirectW(&lf) }
+    lf
 }
 
 unsafe fn measure_font_height_dc(hdc: HDC, font: HFONT, dpi: u32) -> i32 {
@@ -191,6 +296,149 @@ unsafe fn measure_font_height_dc(hdc: HDC, font: HFONT, dpi: u32) -> i32 {
 
 fn scale_px(px_at_96: i32, dpi: u32) -> i32 {
     ((px_at_96 as i64 * dpi.max(96) as i64) + 48) as i32 / 96
+}
+
+/// Generates a custom 32-bit ARGB vector icon in memory (azure rounded badge +
+/// speed-gauge arc + dual upload/download arrows) for the titlebar & taskbar.
+unsafe fn create_app_icon(size: i32) -> HICON {
+    let sz = size.clamp(16, 128);
+    let mut biv5 = BITMAPV5HEADER {
+        bV5Size: std::mem::size_of::<BITMAPV5HEADER>() as u32,
+        bV5Width: sz,
+        bV5Height: -sz, // top-down ARGB DIB
+        bV5Planes: 1,
+        bV5BitCount: 32,
+        bV5Compression: BI_BITFIELDS as u32,
+        bV5RedMask: 0x00FF_0000,
+        bV5GreenMask: 0x0000_FF00,
+        bV5BlueMask: 0x0000_00FF,
+        bV5AlphaMask: 0xFF00_0000,
+        ..Default::default()
+    };
+
+    let mut bits_ptr: *mut c_void = std::ptr::null_mut();
+    let hbm_color = unsafe {
+        CreateDIBSection(
+            None,
+            (&mut biv5 as *mut BITMAPV5HEADER).cast::<BITMAPINFO>(),
+            DIB_RGB_COLORS as u32,
+            &mut bits_ptr,
+            None,
+            0,
+        )
+    };
+    if hbm_color.0.is_null() || bits_ptr.is_null() {
+        if !hbm_color.0.is_null() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(hbm_color.0)) };
+        }
+        return HICON(std::ptr::null_mut());
+    }
+
+    let pixel_count = (sz * sz) as usize;
+    let pixels = unsafe { std::slice::from_raw_parts_mut(bits_ptr.cast::<u32>(), pixel_count) };
+    let inv = 1.0f32 / (sz as f32);
+
+    for py in 0..sz {
+        for px in 0..sz {
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_a = 0.0f32;
+
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let u = (px as f32 + (sx as f32 + 0.5) * 0.5) * inv * 2.0 - 1.0;
+                    let v = (py as f32 + (sy as f32 + 0.5) * 0.5) * inv * 2.0 - 1.0;
+                    let [r, g, b, a] = sample_icon_pixel(u, v);
+                    acc_r += r * a;
+                    acc_g += g * a;
+                    acc_b += b * a;
+                    acc_a += a;
+                }
+            }
+
+            let a = (acc_a * 0.25).clamp(0.0, 1.0);
+            let (r, g, b) = if acc_a > 0.001 {
+                (
+                    (acc_r / acc_a).clamp(0.0, 1.0),
+                    (acc_g / acc_a).clamp(0.0, 1.0),
+                    (acc_b / acc_a).clamp(0.0, 1.0),
+                )
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+
+            let aa = (a * 255.0).round() as u32;
+            let rr = (r * 255.0).round() as u32;
+            let gg = (g * 255.0).round() as u32;
+            let bb = (b * 255.0).round() as u32;
+            pixels[(py * sz + px) as usize] = (aa << 24) | (rr << 16) | (gg << 8) | bb;
+        }
+    }
+
+    let hbm_mask = unsafe { CreateBitmap(sz, sz, 1, 1, None) };
+    if hbm_mask.0.is_null() {
+        let _ = unsafe { DeleteObject(HGDIOBJ(hbm_color.0)) };
+        return HICON(std::ptr::null_mut());
+    }
+
+    let ii = ICONINFO {
+        fIcon: BOOL(1),
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: hbm_mask,
+        hbmColor: hbm_color,
+    };
+    let hicon = unsafe { CreateIconIndirect(&ii) };
+    let _ = unsafe { DeleteObject(HGDIOBJ(hbm_color.0)) };
+    let _ = unsafe { DeleteObject(HGDIOBJ(hbm_mask.0)) };
+    hicon
+}
+
+fn sample_icon_pixel(u: f32, v: f32) -> [f32; 4] {
+    let half = 0.88f32;
+    let rad = 0.26f32;
+    let qx = u.abs() - (half - rad);
+    let qy = v.abs() - (half - rad);
+    let sdf = (qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)) - rad;
+    if sdf > 0.03 {
+        return [0.0, 0.0, 0.0, 0.0];
+    }
+    let badge_alpha = ((-sdf + 0.03) / 0.06).clamp(0.0, 1.0);
+
+    let t = ((u + v + 1.8) / 3.6).clamp(0.0, 1.0);
+    let mut r = 0.02 * (1.0 - t) + 0.06 * t;
+    let mut g = 0.52 * (1.0 - t) + 0.24 * t;
+    let mut b = 0.82 * (1.0 - t) + 0.52 * t;
+
+    if sdf > -0.055 {
+        r = r * 0.72 + 0.55 * 0.28;
+        g = g * 0.72 + 0.85 * 0.28;
+        b = b * 0.72 + 1.00 * 0.28;
+    }
+
+    let dist = u.hypot(v);
+    let angle = v.atan2(u);
+    let in_arc = !(angle > 0.72 && angle < 2.42);
+    if in_arc && (dist - 0.62).abs() < 0.055 {
+        return [0.85, 0.95, 1.0, badge_alpha];
+    }
+
+    // Left upward arrow (Upload)
+    let up_shaft = (u + 0.19).abs() < 0.075 && v > -0.20 && v < 0.36;
+    let up_head = v >= -0.44 && v <= -0.10 && (u + 0.19).abs() <= (v + 0.44) * 0.78 + 0.02;
+    if up_shaft || up_head {
+        return [1.0, 1.0, 1.0, badge_alpha];
+    }
+
+    // Right downward arrow (Download)
+    let dn_shaft = (u - 0.19).abs() < 0.075 && v > -0.36 && v < 0.20;
+    let dn_head = v >= 0.10 && v <= 0.44 && (u - 0.19).abs() <= (0.44 - v) * 0.78 + 0.02;
+    if dn_shaft || dn_head {
+        return [0.49, 0.89, 1.0, badge_alpha];
+    }
+
+    [r, g, b, badge_alpha]
 }
 
 struct UiState {
@@ -274,7 +522,7 @@ unsafe fn get_text(hwnd: HWND) -> String {
 }
 
 unsafe fn set_font(hwnd: HWND, font: HFONT) {
-    let _ = unsafe { SendMessageW(hwnd, WM_SETFONT as u32, WPARAM(font.0 as usize), LPARAM(0)) };
+    let _ = unsafe { SendMessageW(hwnd, WM_SETFONT as u32, WPARAM(font.0 as usize), LPARAM(1)) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -294,12 +542,19 @@ unsafe fn create_ctrl(
     } else {
         Some(HMENU(id as *mut c_void))
     };
+    let is_groupbox = (style & (BS_GROUPBOX as u32)) == (BS_GROUPBOX as u32);
+    // GroupBoxes must NOT set WS_CLIPSIBLINGS/WS_CLIPCHILDREN or they occlude inner controls.
+    let final_style = if is_groupbox {
+        style
+    } else {
+        style | (WS_CLIPSIBLINGS as u32)
+    };
     let hwnd = unsafe {
         CreateWindowExW(
             ex_style,
             class_name,
             PCWSTR(wide.as_ptr()),
-            style | WS_CLIPCHILDREN as u32 | WS_CLIPSIBLINGS as u32,
+            final_style,
             0,
             0,
             10,
@@ -352,7 +607,7 @@ impl UiState {
             set_font(self.lbl_down_row, t.font_ui);
 
             set_font(self.grp_log, t.font_bold);
-            set_font(self.edit_log, t.font_mono);
+            set_font(self.edit_log, t.font_log);
         }
     }
 
@@ -373,7 +628,7 @@ impl UiState {
         let multi_edit_h = lh * 3 + s(16);
         let btn_h = lh + s(16);
 
-        let mut hdwp = unsafe { BeginDeferWindowPos(32) };
+        let mut hdwp = unsafe { BeginDeferWindowPos(40) };
         let defer = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
             if !hdwp.0.is_null() {
                 *hdwp = unsafe {
@@ -390,6 +645,34 @@ impl UiState {
                 };
             } else {
                 let _ = unsafe { MoveWindow(hwnd, x, y, cx.max(1), cy.max(1), true) };
+            }
+        };
+        let defer_bottom = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
+            if !hdwp.0.is_null() {
+                *hdwp = unsafe {
+                    DeferWindowPos(
+                        *hdwp,
+                        hwnd,
+                        Some(HWND_BOTTOM),
+                        x,
+                        y,
+                        cx.max(1),
+                        cy.max(1),
+                        SWP_NOACTIVATE as u32,
+                    )
+                };
+            } else {
+                let _ = unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        Some(HWND_BOTTOM),
+                        x,
+                        y,
+                        cx.max(1),
+                        cy.max(1),
+                        SWP_NOACTIVATE as u32,
+                    )
+                };
             }
         };
 
@@ -494,7 +777,7 @@ impl UiState {
         cy += multi_edit_h + s(12);
 
         let cfg_h = cy - cfg_top;
-        defer(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
+        defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
         y = cfg_top + cfg_h + s(10);
 
         // Action buttons row (4 wider primary actions + 3 compact utility buttons)
@@ -526,7 +809,7 @@ impl UiState {
         // Group 2: Metrics (4 full-width clear rows)
         let met_top = y;
         let met_h = cfg_title_offset + row_h * 4 + s(10);
-        defer(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
+        defer_bottom(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
 
         let mut my = met_top + cfg_title_offset;
         defer(&mut hdwp, self.lbl_conn_row1, cfg_x, my, cfg_inner_w, row_h);
@@ -541,7 +824,7 @@ impl UiState {
         // Group 3: Log
         let log_top = y;
         let log_h = (height - log_top - s(12)).max(s(140));
-        defer(&mut hdwp, self.grp_log, margin, log_top, w, log_h);
+        defer_bottom(&mut hdwp, self.grp_log, margin, log_top, w, log_h);
         defer(
             &mut hdwp,
             self.edit_log,
@@ -704,7 +987,12 @@ impl UiState {
             unsafe { set_text(self.edit_log, &full_text) };
             let end_pos = unsafe { GetWindowTextLengthW(self.edit_log) } as usize;
             let _ = unsafe {
-                SendMessageW(self.edit_log, EM_SETSEL, WPARAM(end_pos), LPARAM(end_pos as isize))
+                SendMessageW(
+                    self.edit_log,
+                    EM_SETSEL,
+                    WPARAM(end_pos),
+                    LPARAM(end_pos as isize),
+                )
             };
             let _ = unsafe { SendMessageW(self.edit_log, EM_SCROLLCARET, WPARAM(0), LPARAM(0)) };
         } else if !lines.is_empty() {
@@ -712,7 +1000,12 @@ impl UiState {
             let wide = to_wide_null(&append_text);
             let end_pos = unsafe { GetWindowTextLengthW(self.edit_log) } as usize;
             let _ = unsafe {
-                SendMessageW(self.edit_log, EM_SETSEL, WPARAM(end_pos), LPARAM(end_pos as isize))
+                SendMessageW(
+                    self.edit_log,
+                    EM_SETSEL,
+                    WPARAM(end_pos),
+                    LPARAM(end_pos as isize),
+                )
             };
             let _ = unsafe {
                 SendMessageW(
@@ -740,11 +1033,18 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         let hinstance = HINSTANCE(hmodule.0);
         let class_name = w!("WinNetStressMainWindow");
 
+        let big_icon_sz = GetSystemMetrics(SM_CXICON).max(32);
+        let sm_icon_sz = GetSystemMetrics(SM_CXSMICON).max(16);
+        let hicon_big = create_app_icon(big_icon_sz);
+        let hicon_sm = create_app_icon(sm_icon_sz);
+
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             style: 0, // Avoid CS_HREDRAW | CS_VREDRAW to prevent resize flicker
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinstance,
+            hIcon: hicon_big,
+            hIconSm: hicon_sm,
             hCursor: LoadCursorW(None, IDC_ARROW),
             hbrBackground: HBRUSH(std::ptr::null_mut()), // Handled cleanly in WM_ERASEBKGND
             lpszClassName: class_name,
@@ -752,6 +1052,12 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         };
 
         if RegisterClassExW(&wc).0 == 0 {
+            if !hicon_big.0.is_null() {
+                let _ = DestroyIcon(hicon_big);
+            }
+            if !hicon_sm.0.is_null() {
+                let _ = DestroyIcon(hicon_sm);
+            }
             return Err("注册 Win32 窗口类失败".to_string());
         }
 
@@ -790,6 +1096,12 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
 
         if hwnd.0.is_null() {
             drop(Box::from_raw(raw_ctx));
+            if !hicon_big.0.is_null() {
+                let _ = DestroyIcon(hicon_big);
+            }
+            if !hicon_sm.0.is_null() {
+                let _ = DestroyIcon(hicon_sm);
+            }
             return Err("创建 Win32 主窗口失败".to_string());
         }
 
@@ -801,6 +1113,13 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+        }
+
+        if !hicon_big.0.is_null() {
+            let _ = DestroyIcon(hicon_big);
+        }
+        if !hicon_sm.0.is_null() {
+            let _ = DestroyIcon(hicon_sm);
         }
     }
 
@@ -844,6 +1163,7 @@ unsafe extern "system" fn wnd_proc(
                 | WS_VSCROLL
                 | ES_AUTOVSCROLL) as u32;
 
+            // Header controls
             let lbl_title = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -881,19 +1201,7 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            let grp_config = unsafe {
-                create_ctrl(
-                    w!("BUTTON"),
-                    " 测试参数与目标配置 (仅内存生效，支持实时编辑) ",
-                    grp_style,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
-
+            // Inner controls for Config (created BEFORE grp_config so they sit above it in Z-order)
             let lbl_streams = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -1059,7 +1367,20 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let grp_config = unsafe {
+                create_ctrl(
+                    w!("BUTTON"),
+                    " 测试参数与目标配置 (仅内存生效，支持实时编辑) ",
+                    grp_style,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
 
+            // Action buttons
             let btn_conn = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
@@ -1145,18 +1466,7 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            let grp_metrics = unsafe {
-                create_ctrl(
-                    w!("BUTTON"),
-                    " 实时测试指标监控 ",
-                    grp_style,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_bold,
-                )
-            };
+            // Inner controls for Metrics (created BEFORE grp_metrics)
             let lbl_conn_row1 = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -1205,7 +1515,33 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let grp_metrics = unsafe {
+                create_ctrl(
+                    w!("BUTTON"),
+                    " 实时测试指标监控 ",
+                    grp_style,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
 
+            // Inner control for Log (created BEFORE grp_log)
+            let edit_log = unsafe {
+                create_ctrl(
+                    w!("EDIT"),
+                    "",
+                    log_style,
+                    WS_EX_CLIENTEDGE as u32,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_log,
+                )
+            };
+            let _ = unsafe { SendMessageW(edit_log, EM_SETLIMITTEXT, WPARAM(1_048_576), LPARAM(0)) };
             let grp_log = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
@@ -1218,19 +1554,6 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_bold,
                 )
             };
-            let edit_log = unsafe {
-                create_ctrl(
-                    w!("EDIT"),
-                    "",
-                    log_style,
-                    WS_EX_CLIENTEDGE as u32,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_mono,
-                )
-            };
-            let _ = unsafe { SendMessageW(edit_log, EM_SETLIMITTEXT, WPARAM(1_048_576), LPARAM(0)) };
 
             let mut ui = Box::new(UiState {
                 app,
@@ -1294,6 +1617,15 @@ unsafe extern "system" fn wnd_proc(
             mmi.ptMinTrackSize.y = scale_px(660, dpi);
             LRESULT(0)
         }
+        m if m == WM_SYSCOLORCHANGE as u32 => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
+            if !ptr.is_null() {
+                let ui = unsafe { &mut *ptr };
+                unsafe { ui.theme.refresh_colors() };
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
+            }
+            LRESULT(0)
+        }
         m if m == WM_ERASEBKGND as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
             if !ptr.is_null() {
@@ -1306,6 +1638,18 @@ unsafe extern "system" fn wnd_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
+        m if m == WM_CTLCOLORBTN as u32 => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
+            if !ptr.is_null() {
+                let ui = unsafe { &*ptr };
+                let hdc = HDC(wparam.0 as *mut _);
+                let _ = unsafe { SetBkMode(hdc, OPAQUE) };
+                let _ = unsafe { SetBkColor(hdc, ui.theme.colors.bg) };
+                let _ = unsafe { SetTextColor(hdc, ui.theme.colors.text_primary) };
+                return LRESULT(ui.theme.brush_bg.0 as isize);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         m if m == WM_CTLCOLORSTATIC as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
             if !ptr.is_null() {
@@ -1315,24 +1659,24 @@ unsafe extern "system" fn wnd_proc(
                 let _ = unsafe { SetBkMode(hdc, OPAQUE) };
 
                 if ctrl == ui.edit_log {
-                    let _ = unsafe { SetBkColor(hdc, COLOR_CARD) };
-                    let _ = unsafe { SetTextColor(hdc, COLOR_TEXT_PRIMARY) };
+                    let _ = unsafe { SetBkColor(hdc, ui.theme.colors.card) };
+                    let _ = unsafe { SetTextColor(hdc, ui.theme.colors.text_primary) };
                     return LRESULT(ui.theme.brush_card.0 as isize);
                 }
 
-                let _ = unsafe { SetBkColor(hdc, COLOR_BG) };
+                let _ = unsafe { SetBkColor(hdc, ui.theme.colors.bg) };
                 let color = if ctrl == ui.lbl_title {
-                    COLOR_BRAND
+                    ui.theme.colors.brand
                 } else if ctrl == ui.lbl_status {
                     if ui.app.stats.mode() == AppMode::Idle {
-                        COLOR_IDLE
+                        ui.theme.colors.idle
                     } else {
-                        COLOR_ACTIVE
+                        ui.theme.colors.active
                     }
                 } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row2 {
-                    COLOR_TEXT_MUTED
+                    ui.theme.colors.text_muted
                 } else {
-                    COLOR_TEXT_PRIMARY
+                    ui.theme.colors.text_primary
                 };
                 let _ = unsafe { SetTextColor(hdc, color) };
                 return LRESULT(ui.theme.brush_bg.0 as isize);
@@ -1345,8 +1689,8 @@ unsafe extern "system" fn wnd_proc(
                 let ui = unsafe { &*ptr };
                 let hdc = HDC(wparam.0 as *mut _);
                 let _ = unsafe { SetBkMode(hdc, OPAQUE) };
-                let _ = unsafe { SetBkColor(hdc, COLOR_CARD) };
-                let _ = unsafe { SetTextColor(hdc, COLOR_TEXT_PRIMARY) };
+                let _ = unsafe { SetBkColor(hdc, ui.theme.colors.card) };
+                let _ = unsafe { SetTextColor(hdc, ui.theme.colors.text_primary) };
                 return LRESULT(ui.theme.brush_card.0 as isize);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
