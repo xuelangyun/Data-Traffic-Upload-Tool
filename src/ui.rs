@@ -27,6 +27,7 @@ const ID_BTN_CLEAR_LOG: usize = 1007;
 const ID_BTN_HELP: usize = 1008;
 const ID_CHK_CONTINUOUS: usize = 1010;
 const ID_TIMER_REFRESH: usize = 2001;
+const MAX_TARGET_ROWS: usize = 8;
 const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
 // Classic Win32 Edit control messages omitted from windows crate UI bindings.
@@ -55,7 +56,7 @@ struct LabelCache {
     rank_row: String,
     wan_ip: String,
     wan_header: String,
-    wan_rows: [String; 8],
+    wan_rows: [String; MAX_TARGET_ROWS],
 }
 
 struct SystemColors {
@@ -517,7 +518,7 @@ struct UiState {
     grp_wan: HWND,
     lbl_wan_ip: HWND,
     lbl_wan_header: HWND,
-    wan_rows: [HWND; 8],
+    wan_rows: [HWND; MAX_TARGET_ROWS],
 
     // Chart (no child window clip - painted directly on parent)
     lbl_chart_title: HWND,
@@ -891,25 +892,21 @@ impl UiState {
         defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
         y = det_top + det_h + s(6);
 
-        // Group 4: WAN egress vertical table (dynamic rows, max 8)
+        // Group 4: remote target distribution table (all rows are included in layout height)
         let wan_top = y;
         let wan_title_offset = lh + s(6);
-        // header + ip line + up to 6 visible rows compact
-        let visible_wan = 6;
-        let wan_h = wan_title_offset + small_row_h * 2 + row_h.min(s(16))*0 + small_row_h * visible_wan + s(6);
-        // Actually compute: 2 small rows (ip + header) + visible rows
-        let wan_h2 = wan_title_offset + small_row_h + small_row_h + (small_row_h * visible_wan) + s(6);
-        defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h2);
+        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_TARGET_ROWS as i32) + s(6);
+        defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, target_table_height);
         let mut wy = wan_top + wan_title_offset;
         defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
         defer(&mut hdwp, self.lbl_wan_header, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
-        for i in 0..8 {
+        for i in 0..MAX_TARGET_ROWS {
             defer(&mut hdwp, self.wan_rows[i], cfg_x, wy, cfg_inner_w, small_row_h);
             wy += small_row_h;
         }
-        y = wan_top + wan_h2 + s(6);
+        y = wan_top + target_table_height + s(6);
 
         // Chart title label + rect (painted directly on parent, no child window)
         let chart_title_h = lh + s(4);
@@ -1068,9 +1065,9 @@ impl UiState {
 
         let t_healthy = stats.conn_targets_healthy.load(Ordering::Relaxed);
         let t_total = stats.conn_targets_total.load(Ordering::Relaxed);
-        let wan_summary = stats.wan_distribution_summary();
+        let wan_summary = stats.target_distribution_summary();
         let conn_row3 = format!(
-            "[WAN 分布] 健康目标: {t_healthy}/{t_total}  |  建连速率: {c_cps}/s  |  RTT: {c_rtt} ms  |  分流: {wan_summary}"
+            "[远端目标分布] 健康目标: {t_healthy}/{t_total}  |  建连速率: {c_cps}/s  |  RTT: {c_rtt} ms  |  当前存活连接占比: {wan_summary}"
         );
         unsafe { set_cached_text(self.lbl_conn_row3, &mut self.cache.conn_row3, conn_row3) };
 
@@ -1184,40 +1181,36 @@ impl UiState {
         let rank_text = format!("[节点排名] 上行: {up_rank}  |  下行: {down_rank}");
         unsafe { set_cached_text(self.lbl_rank_row, &mut self.cache.rank_row, rank_text) };
 
-        // WAN egress auto-detected public IP + vertical distribution
-        let wan_ip_raw = stats.wan_public_ip.lock().clone();
-        let wan_ip_disp = if wan_ip_raw.is_empty() || wan_ip_raw == "检测中..." {
-            "检测中...".to_string()
-        } else {
-            wan_ip_raw.clone()
-        };
-        let wan_age = {
-            let last = stats.wan_last_update_ms.load(Ordering::Relaxed);
+        // Independent public-IP observations by destination; not a WAN1/WAN2 mapping.
+        let egress_ip_raw = stats.egress_ip_observations.lock().clone();
+        let egress_ip_disp = if egress_ip_raw.is_empty() { "等待探测".to_string() } else { egress_ip_raw };
+        let egress_ip_age = {
+            let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last==0 { "".to_string() } else {
                 let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
                 let secs = now_ms.saturating_sub(last)/1000;
                 if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
             }
         };
-        let wan_ip_text = format!("出口公网IP: {} (自动探测·每35s刷新{}) | 本机分流见下表(动态调整)", wan_ip_disp, wan_age);
+        let wan_ip_text = format!("公网出口 IP 抽样（不同探测目标；不等同 WAN 线路）: {}{}", egress_ip_disp, egress_ip_age);
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_ip_text) };
 
-        let wan_header_text = "  序号  目标(出口标识)                 存活/峰值   成功率   RTT   占比".to_string();
+        let wan_header_text = "  序号  远端目标                     存活/峰值   建连成功率 RTT 当前占比".to_string();
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
-        let wan_rows = stats.wan_vertical_rows();
-        for idx in 0..8 {
-            let next = if idx < wan_rows.len() {
-                let r = &wan_rows[idx];
+        let target_rows = stats.target_distribution_rows();
+        for idx in 0..MAX_TARGET_ROWS {
+            let next = if idx < target_rows.len() {
+                let r = &target_rows[idx];
                 // Format aligned columns: use fixed-width like formatting
                 // e.g., " ① 223.5.5.5:443 (223.5.5.5)    12/45  98.1%  14ms  31.2%"
-                let label_disp = if r.label.len() > 22 { format!("{}…", &r.label[..21]) } else { r.label.clone() };
+                let label_disp: String = r.label.chars().take(22).collect();
                 format!("  {:>2}. {:<24} {:>3}/{:<3}  {:>5.1}%  {:>3}ms  {:>4.1}%",
                     idx+1, label_disp, r.active, r.peak, r.pct, r.rtt, r.share)
             } else {
                 if stats.mode()==crate::state::AppMode::Idle && idx==0 {
-                    "  (空闲 — 开始并发测试后自动显示各出口分布)".to_string()
-                } else if wan_rows.is_empty() && idx==0 {
+                    "  (空闲 — 开始连接测试后显示远端目标分布)".to_string()
+                } else if target_rows.is_empty() && idx==0 {
                     "  等待健康检查...".to_string()
                 } else {
                     "".to_string()
@@ -2098,7 +2091,7 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_small,
                 )
             };
-            let mut wan_rows: [HWND; 8] = [HWND(std::ptr::null_mut()); 8];
+            let mut wan_rows: [HWND; MAX_TARGET_ROWS] = [HWND(std::ptr::null_mut()); 8];
             for i in 0..8 {
                 wan_rows[i] = unsafe {
                     create_ctrl(
@@ -2116,7 +2109,7 @@ unsafe extern "system" fn wnd_proc(
             let grp_wan = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
-                    " 多 WAN 出口分布 (自动推测公网IP·竖排动态显示) ",
+                    " 远端目标连接分布（不代表物理 WAN 线路） ",
                     grp_style,
                     0,
                     hwnd,
@@ -2431,13 +2424,13 @@ unsafe extern "system" fn wnd_proc(
                         let help_text = concat!(
                             "1. 纯内存原则：配置、统计和日志全部保存在进程内存中，退出即销毁，不读写本地磁盘或注册表。\n\n",
                             "2. 测速准确性：\n",
-                            "  · 上行严格区分【生成数据量/客户端发送量/服务端确认接收量】，仅服务端确认量计入有效速率；\n",
+                            "  · 上行统计区分【HTTP Body 已交给客户端发送流】与【完整请求体后收到 2xx 响应】；2xx 不等于逐字节服务端 ACK；\n",
                             "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
                             "  · 失败请求独立统计，不计入成功率分母。\n\n",
                             "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
-                            "4. 多 WAN 说明：单条 TCP 连接仅走单条出口，多目标并发才会分散至多条线路；本工具按独立 IP 列表原子轮询分散连接，并记录各 IP 连接数与速率，但不假设多 IP=多 WAN，需对照路由器/网卡实际流量验证。\n\n",
+                            "4. 出口识别：表格展示的是远端目标连接分布，不是 WAN1/WAN2 实际端口分布；公网 IP 抽样按不同探测目标独立采集，也不能单独证明 WAN 线路映射。要确认物理 WAN 流量，需要读取路由器接口计数器或 SNMP。\n\n",
                             "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
-                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样网卡收发字节、名称、状态、链路速率，对比应用流量与网卡总流量，并显示 TCP 重传率与 RTT/失败率。\n\n",
+                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样物理网卡收发字节、名称、状态、链路速率，避免将虚拟接口重复叠加，并显示 TCP 重传率与 RTT/失败率。\n\n",
                             "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
                         );
                         let wide = to_wide_null(help_text);
