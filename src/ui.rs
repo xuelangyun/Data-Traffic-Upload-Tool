@@ -1358,7 +1358,7 @@ unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::st
     let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(mem_bmp.0)) };
 
     // Fill background with card color
-    let mut fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
+    let fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
     let _ = unsafe { FillRect(mem_dc, &fill_rc, theme.brush_card) };
 
     // Border
