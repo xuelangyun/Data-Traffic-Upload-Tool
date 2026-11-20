@@ -1,6 +1,6 @@
 [package]
 name = "win_net_stress"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 rust-version = "1.96"
 description = "Pure in-memory native Windows (Win32 API) public network connection & bandwidth stress tester"
