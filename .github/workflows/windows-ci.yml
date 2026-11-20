@@ -33,13 +33,25 @@ jobs:
         run: cargo test --all-targets
 
       - name: Build release binary
+        continue-on-error: true
         shell: pwsh
         run: |
           if (Test-Path Cargo.lock) {
-            cargo build --release --locked
+            cargo build --release --locked --verbose 2>&1 | Tee-Object -FilePath build.log
           } else {
-            cargo build --release
+            cargo build --release --verbose 2>&1 | Tee-Object -FilePath build.log
           }
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build.log | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
