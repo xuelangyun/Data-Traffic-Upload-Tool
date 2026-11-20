@@ -559,7 +559,7 @@ unsafe fn create_listview(parent: HWND, hinst: HINSTANCE, font: HFONT) -> HWND {
             WS_EX_CLIENTEDGE as u32,
             PCWSTR(wide.as_ptr()),
             PCWSTR(std::ptr::null()),
-            (WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | LVS_REPORT as u32 | LVS_SHOWSELALWAYS as u32 | LVS_SINGLESEL as u32) as u32,
+            (WS_CHILD as u32 | WS_VISIBLE as u32 | WS_CLIPSIBLINGS as u32 | LVS_REPORT as u32 | LVS_SHOWSELALWAYS as u32 | LVS_SINGLESEL as u32) as u32,
             0,0,10,10,
             Some(parent),
             None,
@@ -570,7 +570,7 @@ unsafe fn create_listview(parent: HWND, hinst: HINSTANCE, font: HFONT) -> HWND {
     if !hwnd.0.is_null() {
         unsafe { set_font(hwnd, font) };
         // Extended styles: gridlines + fullrowselect + doublebuffer (0x00010000)
-        let ex = (LVS_EX_GRIDLINES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_HEADERDRAGDROP) as usize;
+        let ex = (0x00000001u32 | 0x00000020u32 | 0x00010000u32 | 0x00000010u32) as usize; // gridlines|fullrowselect|doublebuffer|headerdragdrop
         let _ = unsafe { SendMessageW(hwnd, LVM_SETEXTENDEDLISTVIEWSTYLE as u32, WPARAM(0), LPARAM(ex as isize)) };
     }
     hwnd
@@ -587,6 +587,7 @@ unsafe fn lv_insert_column(hwnd: HWND, idx: i32, title: &str, width: i32, fmt: i
         iSubItem: 0,
         iImage: 0,
         iOrder: 0,
+        ..Default::default()
     };
     let _ = unsafe { SendMessageW(hwnd, LVM_INSERTCOLUMNW as u32, WPARAM(idx as usize), LPARAM(&mut col as *mut _ as isize)) };
 }
@@ -1390,7 +1391,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         let sm_icon_sz = GetSystemMetrics(SM_CXSMICON).max(16);
         // Init ListView common controls for table alignment (prevent freeze via double buffer)
         unsafe {
-            let mut icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES };
+            let mut icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LISTVIEW_CLASSES as u32 };
             InitCommonControlsEx(&icc);
         }
 
@@ -2017,7 +2018,7 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         ui.theme.colors.active
                     }
-                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row3 || ctrl == ui.lbl_nic_row || ctrl == ui.lbl_rank_row {
+                } else if ctrl == ui.lbl_mem_badge {
                     ui.theme.colors.text_muted
                 } else {
                     ui.theme.colors.text_primary
