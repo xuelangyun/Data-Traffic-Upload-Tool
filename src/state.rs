@@ -488,7 +488,7 @@ pub struct SharedStats {
     // Chart history (up to 120 points = 60s at 500ms)
     pub speed_history: Mutex<VecDeque<SpeedSamplePoint>>,
 
-    // WAN egress public IP auto-detected
+    // Public egress IP observations grouped by probe destination; not WAN identities.
     pub egress_ip_observations: Mutex<String>,
     pub egress_ip_last_update_ms: AtomicU64,
 }
