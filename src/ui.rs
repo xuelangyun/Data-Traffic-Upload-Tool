@@ -547,10 +547,16 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn parse_wan_ip_map(raw: &str) -> [Option<IpAddr>; MAX_WAN_PORTS] {
-    let mut result: [Option<IpAddr>; MAX_WAN_PORTS] = std::array::from_fn(|_| None);
+#[derive(Debug, Clone, Copy, Default)]
+struct WanIpMapping {
+    interface_ip: Option<IpAddr>,
+    expected_egress_ip: Option<IpAddr>,
+}
+
+fn parse_wan_ip_map(raw: &str) -> [WanIpMapping; MAX_WAN_PORTS] {
+    let mut result: [WanIpMapping; MAX_WAN_PORTS] = std::array::from_fn(|_| WanIpMapping::default());
     for item in raw.split(|ch| ch == ';' || ch == ',' || ch == '\n' || ch == '\r') {
-        let Some((name, address)) = item.trim().split_once('=') else {
+        let Some((name, value)) = item.trim().split_once('=') else {
             continue;
         };
         let Some(index) = name.trim().to_ascii_uppercase().strip_prefix("WAN")
@@ -559,9 +565,18 @@ fn parse_wan_ip_map(raw: &str) -> [Option<IpAddr>; MAX_WAN_PORTS] {
         else {
             continue;
         };
-        if index < MAX_WAN_PORTS {
-            result[index] = address.trim().parse::<IpAddr>().ok();
+        if index >= MAX_WAN_PORTS {
+            continue;
         }
+
+        let (interface_text, egress_text) = match value.trim().split_once('>') {
+            Some((interface_ip, egress_ip)) => (interface_ip.trim(), egress_ip.trim()),
+            None => (value.trim(), value.trim()),
+        };
+        result[index] = WanIpMapping {
+            interface_ip: interface_text.parse::<IpAddr>().ok(),
+            expected_egress_ip: egress_text.parse::<IpAddr>().ok(),
+        };
     }
     result
 }
@@ -576,36 +591,43 @@ fn parse_egress_ip_observations(raw: &str) -> Vec<(String, IpAddr)> {
 }
 
 fn build_wan_port_rows(
-    configured: &[Option<IpAddr>; MAX_WAN_PORTS],
+    configured: &[WanIpMapping; MAX_WAN_PORTS],
     samples: &[(String, IpAddr)],
 ) -> [String; MAX_WAN_PORTS] {
     std::array::from_fn(|index| {
         let port = format!("WAN{}", index + 1);
-        let Some(address) = configured[index] else {
-            return format!("{port:<5} {:<39} {:>4} {:<8} {}", "NOT SET", 0, "CONFIG", "-");
+        let mapping = configured[index];
+        let interface_text = mapping
+            .interface_ip
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "NOT SET".to_string());
+        let Some(expected_egress_ip) = mapping.expected_egress_ip else {
+            return format!(
+                "{port:<5} {interface_text:<39} {:<39} {:>4} {:<10}",
+                "NOT SET", 0, "NO EXIT IP"
+            );
         };
-        let duplicate_ip = configured
+
+        let duplicate_egress_ip = configured
             .iter()
-            .filter(|candidate| **candidate == Some(address))
+            .filter(|candidate| candidate.expected_egress_ip == Some(expected_egress_ip))
             .count() > 1;
         let providers: Vec<&str> = samples
             .iter()
-            .filter(|(_, observed)| *observed == address)
+            .filter(|(_, observed)| *observed == expected_egress_ip)
             .map(|(provider, _)| provider.as_str())
             .collect();
-        let status = if duplicate_ip {
-            "DUP IP"
+        let status = if duplicate_egress_ip {
+            "DUP EXIT IP"
         } else if providers.is_empty() {
             "NO MATCH"
         } else {
             "MATCH"
         };
-        let provider_text = providers.iter().take(2).copied().collect::<Vec<_>>().join(", ");
         format!(
-            "{port:<5} {address:<39} {:>4} {:<8} {}",
+            "{port:<5} {interface_text:<39} {expected_egress_ip:<39} {:>4} {:<10}",
             providers.len(),
-            status,
-            if provider_text.is_empty() { "-" } else { &provider_text }
+            status
         )
     })
 }
@@ -1030,7 +1052,7 @@ impl UiState {
             set_text(self.edit_tcp_targets, DEFAULT_TCP_TARGETS);
             set_text(self.edit_up_targets, DEFAULT_UPLOAD_TARGETS);
             set_text(self.edit_down_targets, DEFAULT_DOWNLOAD_TARGETS);
-            set_text(self.edit_wan_map, "WAN1=; WAN2=; WAN3=; WAN4=");
+            set_text(self.edit_wan_map, "WAN1=>; WAN2=>; WAN3=>; WAN4=>");
             let _ = SendMessageW(
                 self.chk_continuous,
                 BM_SETCHECK as u32,
@@ -1296,8 +1318,8 @@ impl UiState {
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
         let wan_header_text = format!(
-            "{:<5} {:<39} {:>4} {:<8} {}",
-            "PORT", "WAN PUBLIC IP", "HITS", "STATUS", "PROBE PROVIDERS"
+            "{:<5} {:<39} {:<39} {:>4} {:<10}",
+            "PORT", "WAN IFACE IP", "PUBLIC EXIT IP", "HITS", "STATUS"
         );
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
@@ -1363,12 +1385,15 @@ mod wan_ip_mapping_tests {
     #[test]
     fn parses_four_wan_public_ip_mappings() {
         let map = parse_wan_ip_map(
-            "WAN1=203.0.113.1; WAN2=198.51.100.2; WAN3=2001:db8::3; WAN4=",
+            "WAN1=203.0.113.1; WAN2=198.51.100.2>203.0.113.22; WAN3=2001:db8::3; WAN4=192.168.10.2>",
         );
-        assert_eq!(map[0], Some("203.0.113.1".parse().unwrap()));
-        assert_eq!(map[1], Some("198.51.100.2".parse().unwrap()));
-        assert_eq!(map[2], Some("2001:db8::3".parse().unwrap()));
-        assert_eq!(map[3], None);
+        assert_eq!(map[0].interface_ip, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(map[0].expected_egress_ip, Some("203.0.113.1".parse().unwrap()));
+        assert_eq!(map[1].interface_ip, Some("198.51.100.2".parse().unwrap()));
+        assert_eq!(map[1].expected_egress_ip, Some("203.0.113.22".parse().unwrap()));
+        assert_eq!(map[2].interface_ip, Some("2001:db8::3".parse().unwrap()));
+        assert_eq!(map[3].interface_ip, Some("192.168.10.2".parse().unwrap()));
+        assert_eq!(map[3].expected_egress_ip, None);
     }
 
     #[test]
@@ -1388,7 +1413,7 @@ mod wan_ip_mapping_tests {
         );
         let rows = build_wan_port_rows(&map, &samples);
         assert!(rows[0].contains("MATCH"));
-        assert!(rows[0].contains("api.ipify.org"));
+        assert!(rows[0].contains("203.0.113.1"));
         assert!(rows[1].contains("NO MATCH"));
     }
 }
@@ -1908,7 +1933,7 @@ unsafe extern "system" fn wnd_proc(
             let lbl_wan_map = unsafe {
                 create_ctrl(
                     w!("STATIC"),
-                    "WAN口公网IP映射（WAN1=IP; WAN2=IP...）:",
+                    "WAN口IP映射（WAN1=接口IP>公网IP; WAN2=接口IP>公网IP...）:",
                     st_left,
                     0,
                     hwnd,
@@ -1920,7 +1945,7 @@ unsafe extern "system" fn wnd_proc(
             let edit_wan_map = unsafe {
                 create_ctrl(
                     w!("EDIT"),
-                    "WAN1=; WAN2=; WAN3=; WAN4=",
+                    "WAN1=>; WAN2=>; WAN3=>; WAN4=>",
                     edt_single,
                     WS_EX_CLIENTEDGE as u32,
                     hwnd,
