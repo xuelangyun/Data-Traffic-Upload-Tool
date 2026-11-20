@@ -878,7 +878,7 @@ fn log_upload_node_report(nodes: &[UploadNode], log: &MemoryLog) {
         let fail = m.requests_fail.load(Ordering::Relaxed);
         let post_sz = m.current_post_bytes.load(Ordering::Relaxed);
         let lat = m.avg_latency_ms();
-        let bytes = m.bytes_http_accepted.load(Ordering::Relaxed);
+        let bytes = m.bytes_succeeded.load(Ordering::Relaxed);
         log.push(format!(
             "  · {} | 速率:{} | HTTP 2xx接受:{} | 请求成/败:{ok}/{fail} | POST:{} | 平均延迟:{lat}ms",
             m.host,
