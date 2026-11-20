@@ -140,10 +140,6 @@ pub struct TargetMetrics {
 
     pub rtt_sum_ms: AtomicU64,
     pub rtt_cnt: AtomicU64,
-    /// Successful connection observations grouped by the socket's local source IP.
-    pub egress_map: Mutex<std::collections::HashMap<String, usize>>,
-    /// Currently open connections grouped by local source IP.
-    pub egress_active: Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl TargetMetrics {
@@ -166,8 +162,6 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
-            egress_map: Mutex::new(std::collections::HashMap::new()),
-            egress_active: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -190,8 +184,6 @@ impl TargetMetrics {
             fail_timeout: AtomicU64::new(0),
             rtt_sum_ms: AtomicU64::new(0),
             rtt_cnt: AtomicU64::new(0),
-            egress_map: Mutex::new(std::collections::HashMap::new()),
-            egress_active: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -233,44 +225,7 @@ impl TargetMetrics {
         }
     }
 
-    pub fn record_egress_connected(&self, local_ip: String) {
-        let Ok(ip) = local_ip.parse::<std::net::IpAddr>() else {
-            return;
-        };
-        if ip.is_unspecified() || ip.is_loopback() {
-            return;
-        }
-        let local_ip = ip.to_string();
 
-        *self.egress_map.lock().entry(local_ip.clone()).or_insert(0) += 1;
-        *self.egress_active.lock().entry(local_ip).or_insert(0) += 1;
-    }
-
-    pub fn release_egress(&self, local_ip: &str) {
-        let mut active = self.egress_active.lock();
-        if let Some(count) = active.get_mut(local_ip) {
-            if *count <= 1 {
-                active.remove(local_ip);
-            } else {
-                *count -= 1;
-            }
-        }
-    }
-    pub fn egress_summary(&self) -> String {
-        let m = self.egress_map.lock();
-        if m.is_empty() { return "-".to_string(); }
-        let mut v: Vec<(&String, &usize)> = m.iter().collect();
-        v.sort_by(|a,b| b.1.cmp(a.1));
-        let top = v.into_iter().take(2).map(|(ip,c)| format!("{}({})", ip, c)).collect::<Vec<_>>().join(",");
-        top
-    }
-    pub fn egress_primary_ip(&self) -> String {
-        let m = self.egress_map.lock();
-        if m.is_empty() { return "-".to_string(); }
-        let mut v: Vec<(&String, &usize)> = m.iter().collect();
-        v.sort_by(|a,b| b.1.cmp(a.1));
-        v[0].0.clone()
-    }
 }
 
 /// Per-IP endpoint stats under a bandwidth target (for multi-IP / multi-WAN dispersion).
@@ -442,16 +397,17 @@ pub struct TargetDistributionRow {
     pub share: f64,
 }
 
-#[derive(Debug, Clone)]
-pub struct WanRow {
-    pub egress_ip: String,
-    pub label: String,
-    pub resolved: String,
-    pub active: usize,
-    pub observations: usize,
-    pub pct: f64,
-    pub rtt: u64,
-    pub share: f64,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressIpObservation {
+    pub provider: String,
+    pub ip: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EgressIpRow {
+    pub ip: String,
+    pub hits: usize,
+    pub providers: Vec<String>,
 }
 
 pub struct SharedStats {
@@ -524,8 +480,8 @@ pub struct SharedStats {
     pub proc_handles: AtomicU32,
     pub tcp_retrans_pct_x100: AtomicU32,
 
-    // Public egress IP observations grouped by probe destination; not WAN identities.
-    pub egress_ip_observations: Mutex<String>,
+    // Latest public egress IPs reported by independent external reflectors.
+    pub egress_ip_observations: Mutex<Vec<EgressIpObservation>>,
     pub egress_ip_last_update_ms: AtomicU64,
 }
 
@@ -587,7 +543,7 @@ impl Default for SharedStats {
             sys_tcp_estab: AtomicU32::new(0),
             proc_handles: AtomicU32::new(0),
             tcp_retrans_pct_x100: AtomicU32::new(0),
-            egress_ip_observations: Mutex::new("等待探测".to_string()),
+            egress_ip_observations: Mutex::new(Vec::new()),
             egress_ip_last_update_ms: AtomicU64::new(0),
         }
     }
@@ -811,89 +767,33 @@ impl SharedStats {
         }).collect()
     }
 
-    /// Flattened table rows grouped by the actual local source IP of each live TCP socket.
-    /// A target can appear under more than one source IP when Windows routes destinations differently.
-    pub fn wan_vertical_rows(&self) -> Vec<WanRow> {
-        let guard = self.target_metrics.lock();
-        let mut grouped: std::collections::HashMap<String, Vec<WanRow>> =
+    /// Aggregate independent public-IP reflector results by observed public IP.
+    /// This identifies distinct egress identities observed by probes, not physical WAN ports.
+    pub fn egress_ip_rows(&self) -> Vec<EgressIpRow> {
+        let observations = self.egress_ip_observations.lock();
+        let mut grouped: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
 
-        for target in guard.iter().filter(|target| target.healthy) {
-            let observations = target.egress_map.lock().clone();
-            let active_by_ip = target.egress_active.lock().clone();
-            let known_active: usize = active_by_ip.values().sum();
-
-            // Show only currently active source-IP groups. Historical counts remain
-            // available as context, but stale source IPs do not occupy rows forever.
-            for (ip, active) in active_by_ip {
-                let count = observations.get(&ip).copied().unwrap_or(0);
-                grouped
-                    .entry(ip.clone())
-                    .or_default()
-                    .push(WanRow {
-                        egress_ip: ip,
-                        label: target.label.clone(),
-                        resolved: target.resolved_addr.clone(),
-                        active,
-                        observations: count,
-                        pct: target.orig_success_rate_pct(),
-                        rtt: target.avg_rtt_ms(),
-                        share: 0.0,
-                    });
+        for observation in observations.iter() {
+            let Ok(ip) = observation.ip.parse::<std::net::IpAddr>() else {
+                continue;
+            };
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                continue;
             }
-
-            // A small fallback row makes connections visible if local_addr() failed.
-            let unknown_active = target
-                .active_conns
-                .load(Ordering::Relaxed)
-                .saturating_sub(known_active);
-            if unknown_active > 0 {
-                grouped
-                    .entry("未识别".to_string())
-                    .or_default()
-                    .push(WanRow {
-                        egress_ip: "未识别".to_string(),
-                        label: target.label.clone(),
-                        resolved: target.resolved_addr.clone(),
-                        active: unknown_active,
-                        observations: 0,
-                        pct: target.orig_success_rate_pct(),
-                        rtt: target.avg_rtt_ms(),
-                        share: 0.0,
-                    });
-            }
+            grouped.entry(ip.to_string()).or_default().push(observation.provider.clone());
         }
 
-        let total_active: usize = grouped
-            .values()
-            .flat_map(|rows| rows.iter())
-            .map(|row| row.active)
-            .sum();
-
-        let mut groups: Vec<(String, Vec<WanRow>)> = grouped.into_iter().collect();
-        groups.sort_by(|(ip_a, rows_a), (ip_b, rows_b)| {
-            let active_a: usize = rows_a.iter().map(|row| row.active).sum();
-            let active_b: usize = rows_b.iter().map(|row| row.active).sum();
-            active_b.cmp(&active_a).then_with(|| ip_a.cmp(ip_b))
-        });
-
-        let mut output = Vec::new();
-        for (_, mut rows) in groups {
-            rows.sort_by(|a, b| {
-                b.active
-                    .cmp(&a.active)
-                    .then_with(|| a.label.cmp(&b.label))
-            });
-            for mut row in rows {
-                row.share = if total_active == 0 {
-                    0.0
-                } else {
-                    row.active as f64 * 100.0 / total_active as f64
-                };
-                output.push(row);
-            }
-        }
-        output
+        let mut rows: Vec<EgressIpRow> = grouped
+            .into_iter()
+            .map(|(ip, mut providers)| {
+                providers.sort();
+                providers.dedup();
+                EgressIpRow { ip, hits: providers.len(), providers }
+            })
+            .collect();
+        rows.sort_by(|a, b| b.hits.cmp(&a.hits).then_with(|| a.ip.cmp(&b.ip)));
+        rows
     }
 
     pub fn node_ranking_summary(nodes: &Mutex<Vec<Arc<NodeSpeedMetrics>>>) -> String {
@@ -1097,72 +997,29 @@ mod tests {
     }
 
     #[test]
-    fn egress_active_counts_are_released_without_losing_observations() {
-        let target = TargetMetrics::healthy("test".to_string(), "203.0.113.10:443".to_string(), 10);
-        target.record_egress_connected("192.168.1.20".to_string());
-        target.record_egress_connected("192.168.1.20".to_string());
-        target.record_egress_connected("0.0.0.0".to_string());
-        target.record_egress_connected("127.0.0.1".to_string());
-
-        assert_eq!(target.egress_active.lock().get("192.168.1.20"), Some(&2));
-        assert_eq!(target.egress_map.lock().get("192.168.1.20"), Some(&2));
-        assert_eq!(target.egress_map.lock().len(), 1);
-
-        target.release_egress("192.168.1.20");
-        assert_eq!(target.egress_active.lock().get("192.168.1.20"), Some(&1));
-        target.release_egress("192.168.1.20");
-        assert!(target.egress_active.lock().is_empty());
-        assert_eq!(target.egress_map.lock().get("192.168.1.20"), Some(&2));
-    }
-
-    #[test]
-    fn wan_rows_group_the_same_local_source_ip_and_sort_by_active_connections() {
+    fn public_egress_observations_are_grouped_by_public_ip() {
         let stats = SharedStats::default();
-        let first = Arc::new(TargetMetrics::healthy(
-            "target-a".to_string(),
-            "203.0.113.1:443".to_string(),
-            12,
-        ));
-        let second = Arc::new(TargetMetrics::healthy(
-            "target-b".to_string(),
-            "203.0.113.2:443".to_string(),
-            18,
-        ));
-        let third = Arc::new(TargetMetrics::healthy(
-            "target-c".to_string(),
-            "203.0.113.3:443".to_string(),
-            24,
-        ));
-
-        first.record_egress_connected("192.168.1.20".to_string());
-        first.active_conns.store(1, Ordering::Relaxed);
-        second.record_egress_connected("192.168.1.20".to_string());
-        second.record_egress_connected("192.168.1.20".to_string());
-        second.active_conns.store(2, Ordering::Relaxed);
-        third.record_egress_connected("192.168.1.21".to_string());
-        third.active_conns.store(1, Ordering::Relaxed);
-        stats.target_metrics.lock().extend([first.clone(), second, third]);
-
-        let rows = stats.wan_vertical_rows();
+        *stats.egress_ip_observations.lock() = vec![
+            EgressIpObservation { provider: "a.example".to_string(), ip: "203.0.113.10".to_string() },
+            EgressIpObservation { provider: "b.example".to_string(), ip: "203.0.113.10".to_string() },
+            EgressIpObservation { provider: "c.example".to_string(), ip: "198.51.100.20".to_string() },
+            EgressIpObservation { provider: "d.example".to_string(), ip: "2001:db8::10".to_string() },
+            EgressIpObservation { provider: "invalid.example".to_string(), ip: "not-an-ip".to_string() },
+            EgressIpObservation { provider: "loopback.example".to_string(), ip: "127.0.0.1".to_string() },
+        ];
+        let rows = stats.egress_ip_rows();
         assert_eq!(rows.len(), 3);
-        assert_eq!(rows[0].egress_ip, "192.168.1.20");
-        assert_eq!(rows[1].egress_ip, "192.168.1.20");
-        assert_eq!(rows[2].egress_ip, "192.168.1.21");
-        assert_eq!(rows[0].active + rows[1].active, 3);
-        assert!((rows[0].share + rows[1].share + rows[2].share - 100.0).abs() < 0.001);
-
-        first.release_egress("192.168.1.20");
-        first.active_conns.store(0, Ordering::Relaxed);
-        let active_rows = stats.wan_vertical_rows();
-        assert_eq!(active_rows.len(), 2);
-        assert_eq!(active_rows[0].egress_ip, "192.168.1.20");
+        assert_eq!(rows[0].ip, "203.0.113.10");
+        assert_eq!(rows[0].hits, 2);
+        assert_eq!(rows[0].providers, vec!["a.example", "b.example"]);
+        assert_eq!(rows[1].ip, "198.51.100.20");
+        assert_eq!(rows[2].ip, "2001:db8::10");
     }
 
     #[test]
-    fn test_compute_p95_and_median() {
-        let vals: Vec<u64> = (1..=20).collect();
-        assert_eq!(compute_p95(&vals), 19);
-        assert_eq!(compute_median(&[10, 50, 20]), 20);
-        assert_eq!(compute_median(&[10, 40, 20, 30]), 25);
+    fn public_egress_rows_are_empty_when_no_probe_succeeded() {
+        let stats = SharedStats::default();
+        assert!(stats.egress_ip_rows().is_empty());
     }
+
 }
