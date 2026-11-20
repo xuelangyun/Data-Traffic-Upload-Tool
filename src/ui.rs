@@ -28,7 +28,7 @@ const ID_BTN_CLEAR_LOG: usize = 1007;
 const ID_BTN_HELP: usize = 1008;
 const ID_CHK_CONTINUOUS: usize = 1010;
 const ID_TIMER_REFRESH: usize = 2001;
-const MAX_WAN_PORTS: usize = 4;
+const MAX_EGRESS_IP_ROWS: usize = 8;
 const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
 // Classic Win32 Edit control messages omitted from windows crate UI bindings.
@@ -57,7 +57,7 @@ struct LabelCache {
     rank_row: String,
     wan_ip: String,
     wan_header: String,
-    wan_rows: [String; MAX_WAN_PORTS],
+    wan_rows: [String; MAX_EGRESS_IP_ROWS],
 }
 
 struct SystemColors {
@@ -499,8 +499,6 @@ struct UiState {
     edit_up_targets: HWND,
     lbl_down_targets: HWND,
     edit_down_targets: HWND,
-    lbl_wan_map: HWND,
-    edit_wan_map: HWND,
 
     // Action buttons
     btn_conn: HWND,
@@ -532,7 +530,7 @@ struct UiState {
     grp_wan: HWND,
     lbl_wan_ip: HWND,
     lbl_wan_header: HWND,
-    wan_rows: [HWND; MAX_WAN_PORTS],
+    wan_rows: [HWND; MAX_EGRESS_IP_ROWS],
 
     // Chart (no child window clip - painted directly on parent)
     lbl_chart_title: HWND,
@@ -547,40 +545,6 @@ fn to_wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct WanIpMapping {
-    interface_ip: Option<IpAddr>,
-    expected_egress_ip: Option<IpAddr>,
-}
-
-fn parse_wan_ip_map(raw: &str) -> [WanIpMapping; MAX_WAN_PORTS] {
-    let mut result: [WanIpMapping; MAX_WAN_PORTS] = std::array::from_fn(|_| WanIpMapping::default());
-    for item in raw.split(|ch| ch == ';' || ch == ',' || ch == '\n' || ch == '\r') {
-        let Some((name, value)) = item.trim().split_once('=') else {
-            continue;
-        };
-        let Some(index) = name.trim().to_ascii_uppercase().strip_prefix("WAN")
-            .and_then(|n| n.parse::<usize>().ok())
-            .and_then(|n| n.checked_sub(1))
-        else {
-            continue;
-        };
-        if index >= MAX_WAN_PORTS {
-            continue;
-        }
-
-        let (interface_text, egress_text) = match value.trim().split_once('>') {
-            Some((interface_ip, egress_ip)) => (interface_ip.trim(), egress_ip.trim()),
-            None => (value.trim(), value.trim()),
-        };
-        result[index] = WanIpMapping {
-            interface_ip: interface_text.parse::<IpAddr>().ok(),
-            expected_egress_ip: egress_text.parse::<IpAddr>().ok(),
-        };
-    }
-    result
-}
-
 fn parse_egress_ip_observations(raw: &str) -> Vec<(String, IpAddr)> {
     raw.split('|')
         .filter_map(|item| {
@@ -590,44 +554,28 @@ fn parse_egress_ip_observations(raw: &str) -> Vec<(String, IpAddr)> {
         .collect()
 }
 
-fn build_wan_port_rows(
-    configured: &[WanIpMapping; MAX_WAN_PORTS],
-    samples: &[(String, IpAddr)],
-) -> [String; MAX_WAN_PORTS] {
-    std::array::from_fn(|index| {
-        let port = format!("WAN{}", index + 1);
-        let mapping = configured[index];
-        let interface_text = mapping
-            .interface_ip
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "NOT SET".to_string());
-        let Some(expected_egress_ip) = mapping.expected_egress_ip else {
-            return format!(
-                "{port:<5} {interface_text:<39} {:<39} {:>4} {:<10}",
-                "NOT SET", 0, "NO EXIT IP"
-            );
-        };
-
-        let duplicate_egress_ip = configured
-            .iter()
-            .filter(|candidate| candidate.expected_egress_ip == Some(expected_egress_ip))
-            .count() > 1;
-        let providers: Vec<&str> = samples
-            .iter()
-            .filter(|(_, observed)| *observed == expected_egress_ip)
-            .map(|(provider, _)| provider.as_str())
-            .collect();
-        let status = if duplicate_egress_ip {
-            "DUP EXIT IP"
-        } else if providers.is_empty() {
-            "NO MATCH"
+fn build_wan_egress_rows(samples: &[(String, IpAddr)]) -> [String; MAX_EGRESS_IP_ROWS] {
+    let mut grouped: Vec<(IpAddr, Vec<&str>)> = Vec::new();
+    for (provider, address) in samples {
+        if let Some((_, providers)) = grouped.iter_mut().find(|(ip, _)| ip == address) {
+            providers.push(provider.as_str());
         } else {
-            "MATCH"
+            grouped.push((*address, vec![provider.as_str()]));
+        }
+    }
+    grouped.sort_by(|left, right| right.1.len().cmp(&left.1.len()));
+
+    std::array::from_fn(|index| {
+        let Some((address, providers)) = grouped.get(index) else {
+            return String::new();
         };
+        let providers_text = providers.join(", ");
         format!(
-            "{port:<5} {interface_text:<39} {expected_egress_ip:<39} {:>4} {:<11}",
+            "{:<7} {:<39} {:>4}  {}",
+            format!("出口{}", index + 1),
+            address,
             providers.len(),
-            status
+            providers_text
         )
     })
 }
@@ -726,8 +674,6 @@ impl UiState {
             set_font(self.edit_up_targets, t.font_ui);
             set_font(self.lbl_down_targets, t.font_ui);
             set_font(self.edit_down_targets, t.font_ui);
-            set_font(self.lbl_wan_map, t.font_ui);
-            set_font(self.edit_wan_map, t.font_ui);
 
             set_font(self.btn_conn, t.font_bold);
             set_font(self.btn_up, t.font_bold);
@@ -929,10 +875,6 @@ impl UiState {
         );
         cy += multi_edit_h + s(8);
 
-        defer(&mut hdwp, self.lbl_wan_map, cfg_x, cy, target_lbl_w, edit_h);
-        defer(&mut hdwp, self.edit_wan_map, target_edt_x, cy, target_edt_w, edit_h);
-        cy += edit_h + s(8);
-
         let cfg_h = cy - cfg_top;
         defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
         y = cfg_top + cfg_h + s(6);
@@ -1000,14 +942,14 @@ impl UiState {
         // Group 4: WAN port mapping table (all four configured ports have fixed-width rows)
         let wan_top = y;
         let wan_title_offset = lh + s(6);
-        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_WAN_PORTS as i32) + s(6);
+        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_EGRESS_IP_ROWS as i32) + s(6);
         defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, target_table_height);
         let mut wy = wan_top + wan_title_offset;
         defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
         defer(&mut hdwp, self.lbl_wan_header, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
-        for i in 0..MAX_WAN_PORTS {
+        for i in 0..MAX_EGRESS_IP_ROWS {
             defer(&mut hdwp, self.wan_rows[i], cfg_x, wy, cfg_inner_w, small_row_h);
             wy += small_row_h;
         }
@@ -1052,7 +994,6 @@ impl UiState {
             set_text(self.edit_tcp_targets, DEFAULT_TCP_TARGETS);
             set_text(self.edit_up_targets, DEFAULT_UPLOAD_TARGETS);
             set_text(self.edit_down_targets, DEFAULT_DOWNLOAD_TARGETS);
-            set_text(self.edit_wan_map, "WAN1=>; WAN2=>; WAN3=>; WAN4=>");
             let _ = SendMessageW(
                 self.chk_continuous,
                 BM_SETCHECK as u32,
@@ -1297,34 +1238,23 @@ impl UiState {
                 if secs < 120 { format!(" · {}s前更新", secs) } else { format!(" · {}m前更新", secs/60) }
             }
         };
-        let wan_map = parse_wan_ip_map(&unsafe { get_text(self.edit_wan_map) });
         let wan_samples = parse_egress_ip_observations(&egress_ip_raw);
-        let configured_ips: Vec<IpAddr> = wan_map.iter().filter_map(|mapping| mapping.expected_egress_ip).collect();
-        let unmatched_ips: Vec<String> = wan_samples
-            .iter()
-            .filter(|(_, ip)| !configured_ips.contains(ip))
-            .map(|(provider, ip)| format!("{provider}={ip}"))
-            .collect();
-        let unmatched_summary = if unmatched_ips.is_empty() {
-            "无未匹配出口".to_string()
-        } else {
-            unmatched_ips.join(", ")
-        };
+        let wan_rows = build_wan_egress_rows(&wan_samples);
+        let unique_exit_count = wan_rows.iter().filter(|row| !row.is_empty()).count();
         let egress_ip_text = format!(
-            "公网出口探测更新时间{} | 未匹配WAN映射: {}",
+            "公网出口探测{} | 检测到 {} 个不同的出口公网 IP",
             egress_ip_age,
-            unmatched_summary
+            unique_exit_count
         );
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, egress_ip_text) };
 
         let wan_header_text = format!(
-            "{:<5} {:<39} {:<39} {:>4} {:<11}",
-            "PORT", "WAN IFACE IP", "PUBLIC EXIT IP", "HITS", "STATUS"
+            "{:<7} {:<39} {:>4}  {}",
+            "出口", "公网出口 IP", "命中", "探测来源"
         );
         unsafe { set_cached_text(self.lbl_wan_header, &mut self.cache.wan_header, wan_header_text) };
 
-        let wan_rows = build_wan_port_rows(&wan_map, &wan_samples);
-        for idx in 0..MAX_WAN_PORTS {
+        for idx in 0..MAX_EGRESS_IP_ROWS {
             let next = wan_rows[idx].clone();
             let hwnd = self.wan_rows[idx];
             unsafe { set_cached_text(hwnd, &mut self.cache.wan_rows[idx], next) };
@@ -1379,42 +1309,32 @@ impl UiState {
 }
 
 #[cfg(test)]
-mod wan_ip_mapping_tests {
+mod wan_egress_ip_tests {
     use super::*;
 
     #[test]
-    fn parses_four_wan_public_ip_mappings() {
-        let map = parse_wan_ip_map(
-            "WAN1=203.0.113.1; WAN2=198.51.100.2>203.0.113.22; WAN3=2001:db8::3; WAN4=192.168.10.2>",
-        );
-        assert_eq!(map[0].interface_ip, Some("203.0.113.1".parse().unwrap()));
-        assert_eq!(map[0].expected_egress_ip, Some("203.0.113.1".parse().unwrap()));
-        assert_eq!(map[1].interface_ip, Some("198.51.100.2".parse().unwrap()));
-        assert_eq!(map[1].expected_egress_ip, Some("203.0.113.22".parse().unwrap()));
-        assert_eq!(map[2].interface_ip, Some("2001:db8::3".parse().unwrap()));
-        assert_eq!(map[3].interface_ip, Some("192.168.10.2".parse().unwrap()));
-        assert_eq!(map[3].expected_egress_ip, None);
-    }
-
-    #[test]
-    fn duplicate_wan_public_ips_are_not_reported_as_unique_matches() {
-        let map = parse_wan_ip_map("WAN1=203.0.113.1; WAN2=203.0.113.1");
-        let samples = parse_egress_ip_observations("api.ipify.org=203.0.113.1");
-        let rows = build_wan_port_rows(&map, &samples);
-        assert!(rows[0].contains("DUP EXIT IP"));
-        assert!(rows[1].contains("DUP EXIT IP"));
-    }
-
-    #[test]
-    fn maps_observed_exit_ip_only_to_an_exact_wan_ip() {
-        let map = parse_wan_ip_map("WAN1=203.0.113.1; WAN2=198.51.100.2");
+    fn groups_probes_by_unique_public_egress_ip() {
         let samples = parse_egress_ip_observations(
-            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=198.51.100.9",
+            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=198.51.100.2 | icanhazip.com=203.0.113.1 | ifconfig.me=203.0.113.3",
         );
-        let rows = build_wan_port_rows(&map, &samples);
-        assert!(rows[0].contains("MATCH"));
+        let rows = build_wan_egress_rows(&samples);
+        assert_eq!(rows.iter().filter(|row| !row.is_empty()).count(), 3);
         assert!(rows[0].contains("203.0.113.1"));
-        assert!(rows[1].contains("NO MATCH"));
+        assert!(rows[0].contains("2"));
+        assert!(rows[0].contains("api.ipify.org"));
+        assert!(rows[1].contains("198.51.100.2"));
+        assert!(rows[2].contains("203.0.113.3"));
+    }
+
+    #[test]
+    fn same_public_ip_from_all_probes_is_one_egress() {
+        let samples = parse_egress_ip_observations(
+            "api.ipify.org=203.0.113.1 | checkip.amazonaws.com=203.0.113.1 | icanhazip.com=203.0.113.1",
+        );
+        let rows = build_wan_egress_rows(&samples);
+        assert_eq!(rows.iter().filter(|row| !row.is_empty()).count(), 1);
+        assert!(rows[0].contains("203.0.113.1"));
+        assert!(rows[0].contains("3"));
     }
 }
 
@@ -1930,30 +1850,6 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
-            let lbl_wan_map = unsafe {
-                create_ctrl(
-                    w!("STATIC"),
-                    "WAN口IP映射（WAN1=接口IP>公网IP; WAN2=接口IP>公网IP...）:",
-                    st_left,
-                    0,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_ui,
-                )
-            };
-            let edit_wan_map = unsafe {
-                create_ctrl(
-                    w!("EDIT"),
-                    "WAN1=>; WAN2=>; WAN3=>; WAN4=>",
-                    edt_single,
-                    WS_EX_CLIENTEDGE as u32,
-                    hwnd,
-                    0,
-                    hinst,
-                    theme.font_ui,
-                )
-            };
             let lbl_down_targets = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -2237,7 +2133,7 @@ unsafe extern "system" fn wnd_proc(
                 )
             };
 
-            // WAN public-IP mapping table (header + four port rows)
+            // WAN public-IP table (unique egress addresses from independent probes)
             // Create rows BEFORE group so they are above group in Z-order
             let lbl_wan_ip = unsafe {
                 create_ctrl(
@@ -2254,7 +2150,7 @@ unsafe extern "system" fn wnd_proc(
             let lbl_wan_header = unsafe {
                 create_ctrl(
                     w!("STATIC"),
-                    " PORT   WAN IFACE IP                            PUBLIC EXIT IP                           HITS STATUS",
+                    " 出口    公网出口 IP                               命中    探测来源",
                     st_left,
                     0,
                     hwnd,
@@ -2263,8 +2159,8 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_small,
                 )
             };
-            let mut wan_rows: [HWND; MAX_WAN_PORTS] = [HWND(std::ptr::null_mut()); MAX_WAN_PORTS];
-            for i in 0..MAX_WAN_PORTS {
+            let mut wan_rows: [HWND; MAX_EGRESS_IP_ROWS] = [HWND(std::ptr::null_mut()); MAX_EGRESS_IP_ROWS];
+            for i in 0..MAX_EGRESS_IP_ROWS {
                 wan_rows[i] = unsafe {
                     create_ctrl(
                         w!("STATIC"),
@@ -2281,7 +2177,7 @@ unsafe extern "system" fn wnd_proc(
             let grp_wan = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
-                    " WAN 口公网 IP 对应（请填写每条 WAN 的公网 IP） ",
+                    " WAN 出口公网 IP（按探测到的唯一公网地址聚合） ",
                     grp_style,
                     0,
                     hwnd,
@@ -2358,8 +2254,6 @@ unsafe extern "system" fn wnd_proc(
                 edit_up_targets,
                 lbl_down_targets,
                 edit_down_targets,
-                lbl_wan_map,
-                edit_wan_map,
                 btn_conn,
                 btn_up,
                 btn_down,
