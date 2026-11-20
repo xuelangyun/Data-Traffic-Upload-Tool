@@ -372,13 +372,16 @@ fn init_runtime_once<'a>(
             }
         });
 
-        // Background WAN egress public IP detector (async via reqwest, polling every 35s)
+        // Sample the public egress IP independently against several providers. These
+        // observations are not WAN-interface identities; each provider is a separate destination.
         let wan_stats = state.stats.clone();
         runtime.spawn(async move {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let client = match reqwest::Client::builder()
+                .http1_only()
                 .timeout(Duration::from_secs(4))
-                .user_agent("WinNetStress/0.4")
+                .pool_max_idle_per_host(0)
+                .user_agent("WinNetStress/0.5")
                 .build()
             {
                 Ok(c) => c,
@@ -389,34 +392,44 @@ fn init_runtime_once<'a>(
                 "https://checkip.amazonaws.com",
                 "https://icanhazip.com",
                 "https://ifconfig.me/ip",
+                "https://ipinfo.io/ip",
+                "https://api64.ipify.org",
+                "https://ipv4.icanhazip.com",
+                "https://ipv6.icanhazip.com",
             ];
             loop {
-                let mut detected: Option<String> = None;
+                // Independent destinations can be routed through different WANs by
+                // destination-based load balancing. Do not reuse keep-alive sockets.
+                let mut probes = tokio::task::JoinSet::new();
                 for url in endpoints {
-                    if let Ok(Ok(resp)) = tokio::time::timeout(
-                        Duration::from_secs(4),
-                        client.get(url).send(),
-                    )
-                    .await
-                    {
-                        if let Ok(txt) = resp.text().await {
-                            let ip = txt.trim().to_string();
-                            if !ip.is_empty() && ip.len() < 64 && ip.chars().all(|c| c.is_ascii_alphanumeric() || c=='.' || c==':' || c=='/') {
-                                // basic ipv4/ipv6 sanity: contains dot or colon
-                                if ip.contains('.') || ip.contains(':') {
-                                    detected = Some(ip);
-                                    break;
-                                }
-                            }
-                        }
+                    let probe_client = client.clone();
+                    probes.spawn(async move {
+                        let request = probe_client
+                            .get(url)
+                            .header(reqwest::header::CONNECTION, "close");
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(4),
+                            request.send(),
+                        )
+                        .await
+                        .ok()?
+                        .ok()?;
+                        let body = response.text().await.ok()?;
+                        let ip = body.trim().parse::<std::net::IpAddr>().ok()?;
+                        let provider = url.split('/').nth(2).unwrap_or(url);
+                        Some(format!("{provider}={ip}"))
+                    });
+                }
+                let mut observations = Vec::new();
+                while let Some(result) = probes.join_next().await {
+                    if let Ok(Some(observation)) = result {
+                        observations.push(observation);
                     }
                 }
-                if let Some(ip) = detected {
-                    let mut guard = wan_stats.wan_public_ip.lock();
-                    if *guard != ip {
-                        *guard = ip.clone();
-                    }
-                    wan_stats.wan_last_update_ms.store(
+                if !observations.is_empty() {
+                    let summary = observations.join(" | ");
+                    *wan_stats.egress_ip_observations.lock() = summary;
+                    wan_stats.egress_ip_last_update_ms.store(
                         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64,
                         Ordering::Relaxed,
                     );

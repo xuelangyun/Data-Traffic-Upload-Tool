@@ -860,7 +860,7 @@ fn log_download_node_report(nodes: &[DownloadNode], log: &MemoryLog) {
         let tcp = m.tcp_connect_ms.load(Ordering::Relaxed);
         let tls = m.tls_handshake_ms.load(Ordering::Relaxed);
         let ttfb = m.ttfb_ms.load(Ordering::Relaxed);
-        let bytes = m.bytes_confirmed.load(Ordering::Relaxed);
+        let bytes = m.bytes_succeeded.load(Ordering::Relaxed);
         let mode = if m.range_supported.load(Ordering::Relaxed) {
             "Range分段"
         } else {
