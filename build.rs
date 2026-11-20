@@ -239,14 +239,14 @@ fn sample_icon_pixel(u: f32, v: f32) -> [f32; 4] {
 
     // Left upward arrow (Upload - crisp white)
     let up_shaft = (u + 0.19).abs() < 0.075 && v > -0.20 && v < 0.36;
-    let up_head = v >= -0.44 && v <= -0.10 && (u + 0.19).abs() <= (v + 0.44) * 0.78 + 0.02;
+    let up_head = (-0.44..=-0.10).contains(&v) && (u + 0.19).abs() <= (v + 0.44) * 0.78 + 0.02;
     if up_shaft || up_head {
         return [1.0, 1.0, 1.0, badge_alpha];
     }
 
     // Right downward arrow (Download - bright cyan)
     let dn_shaft = (u - 0.19).abs() < 0.075 && v > -0.36 && v < 0.20;
-    let dn_head = v >= 0.10 && v <= 0.44 && (u - 0.19).abs() <= (0.44 - v) * 0.78 + 0.02;
+    let dn_head = (0.10..=0.44).contains(&v) && (u - 0.19).abs() <= (0.44 - v) * 0.78 + 0.02;
     if dn_shaft || dn_head {
         return [0.49, 0.89, 1.0, badge_alpha];
     }
