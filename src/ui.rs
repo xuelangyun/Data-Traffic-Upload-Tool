@@ -1,6 +1,7 @@
 //! Native Win32 GUI with zero-flicker GDI rendering, Per-Monitor DPI scaling,
-//! Windows system style & font adaptation, custom vector window icon, and pure
-//! in-memory state updates.
+//! Windows system style & font adaptation, custom vector window icon, real-time
+//! speed curves (upload/download/duplex), NIC monitoring, node ranking and
+//! pure in-memory state updates.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -19,11 +20,12 @@ use crate::state::{
 const ID_BTN_CONN: usize = 1001;
 const ID_BTN_UP: usize = 1002;
 const ID_BTN_DOWN: usize = 1003;
-const ID_BTN_STOP: usize = 1004;
-const ID_BTN_RESET: usize = 1005;
-const ID_BTN_CLEAR_LOG: usize = 1006;
-const ID_BTN_HELP: usize = 1007;
-const ID_CHK_CONTINUOUS: usize = 1008;
+const ID_BTN_DUPLEX: usize = 1004;
+const ID_BTN_STOP: usize = 1005;
+const ID_BTN_RESET: usize = 1006;
+const ID_BTN_CLEAR_LOG: usize = 1007;
+const ID_BTN_HELP: usize = 1008;
+const ID_CHK_CONTINUOUS: usize = 1010;
 const ID_TIMER_REFRESH: usize = 2001;
 const WM_APP_WARMUP: u32 = (WM_APP as u32) + 1;
 
@@ -43,8 +45,14 @@ struct LabelCache {
     mem_badge: String,
     conn_row1: String,
     conn_row2: String,
+    conn_row3: String,
     up_row: String,
+    up_detail: String,
     down_row: String,
+    down_detail: String,
+    duplex_row: String,
+    nic_row: String,
+    rank_row: String,
 }
 
 struct SystemColors {
@@ -65,8 +73,6 @@ impl SystemColors {
         let text_muted = COLORREF(unsafe { GetSysColor(COLOR_GRAYTEXT) });
         let hotlight = COLORREF(unsafe { GetSysColor(COLOR_HOTLIGHT) });
 
-        // Compute relative luminance of card/bg to adapt status/brand colors cleanly
-        // even under high-contrast or dark-adapted system themes.
         let bg_luma = color_luma(bg);
         let brand = if hotlight.0 != 0 {
             hotlight
@@ -113,6 +119,7 @@ struct ThemeResources {
     font_ui: HFONT,
     font_bold: HFONT,
     font_log: HFONT,
+    font_small: HFONT,
     colors: SystemColors,
     brush_bg: HBRUSH,
     brush_card: HBRUSH,
@@ -121,7 +128,7 @@ struct ThemeResources {
 impl ThemeResources {
     unsafe fn create(dpi: u32) -> Self {
         let safe_dpi = dpi.max(96);
-        let (font_title, font_ui, font_bold, font_log, line_h, title_h) =
+        let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
         let colors = unsafe { SystemColors::query() };
         let brush_bg = unsafe { CreateSolidBrush(colors.bg) };
@@ -135,6 +142,7 @@ impl ThemeResources {
             font_ui,
             font_bold,
             font_log,
+            font_small,
             colors,
             brush_bg,
             brush_card,
@@ -148,14 +156,16 @@ impl ThemeResources {
             delete_font(&mut self.font_ui);
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
+            delete_font(&mut self.font_small);
         }
-        let (font_title, font_ui, font_bold, font_log, line_h, title_h) =
+        let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
         self.dpi = safe_dpi;
         self.font_title = font_title;
         self.font_ui = font_ui;
         self.font_bold = font_bold;
         self.font_log = font_log;
+        self.font_small = font_small;
         self.line_h = line_h;
         self.title_h = title_h;
     }
@@ -178,6 +188,7 @@ impl ThemeResources {
             delete_font(&mut self.font_ui);
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
+            delete_font(&mut self.font_small);
             if !self.brush_bg.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.brush_bg.0));
                 self.brush_bg = HBRUSH(std::ptr::null_mut());
@@ -197,7 +208,7 @@ unsafe fn delete_font(font: &mut HFONT) {
     }
 }
 
-unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32) {
+unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, HFONT, i32, i32) {
     let hdc = unsafe { GetDC(None) };
     let sys_dpi = if !hdc.0.is_null() {
         let y = unsafe { GetDeviceCaps(Some(hdc), LOGPIXELSY) };
@@ -206,7 +217,6 @@ unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32)
         96
     };
 
-    // Query the active Windows system UI font (e.g., Microsoft YaHei UI / Segoe UI).
     let mut ncm = NONCLIENTMETRICSW {
         cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
         ..Default::default()
@@ -227,7 +237,6 @@ unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32)
         make_logfont("Microsoft YaHei UI", 9, FW_NORMAL, dpi as i32)
     };
 
-    // Scale system message font to the target window DPI cleanly.
     let raw_pt = if base_lf.lfHeight != 0 {
         ((base_lf.lfHeight.unsigned_abs() * 72) + (sys_dpi / 2)) / sys_dpi
     } else {
@@ -249,8 +258,11 @@ unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32)
     title_lf.lfWeight = FW_BOLD;
     let font_title = unsafe { CreateFontIndirectW(&title_lf) };
 
-    // Use the exact same system UI font for logs so Chinese & ASCII glyphs render uniformly.
     let font_log = unsafe { CreateFontIndirectW(&base_lf) };
+
+    let mut small_lf = base_lf;
+    small_lf.lfHeight = -(((base_pt - 1).max(8) * dpi as i32) / 72);
+    let font_small = unsafe { CreateFontIndirectW(&small_lf) };
 
     let line_h = unsafe { measure_font_height_dc(hdc, font_ui, dpi) };
     let title_h = unsafe { measure_font_height_dc(hdc, font_title, dpi) };
@@ -259,7 +271,7 @@ unsafe fn create_font_bundle(dpi: u32) -> (HFONT, HFONT, HFONT, HFONT, i32, i32)
         let _ = unsafe { ReleaseDC(None, hdc) };
     }
 
-    (font_title, font_ui, font_bold, font_log, line_h, title_h)
+    (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h)
 }
 
 fn make_logfont(face: &str, pt_size: i32, weight: i32, effective_dpi: i32) -> LOGFONTW {
@@ -449,6 +461,7 @@ struct UiState {
     last_mode_active: Option<bool>,
     log_gen: u64,
     log_seq: u64,
+    chart_rect: RECT,
 
     // Header
     lbl_title: HWND,
@@ -475,6 +488,7 @@ struct UiState {
     btn_conn: HWND,
     btn_up: HWND,
     btn_down: HWND,
+    btn_duplex: HWND,
     btn_stop: HWND,
     btn_reset: HWND,
     btn_clear_log: HWND,
@@ -484,8 +498,20 @@ struct UiState {
     grp_metrics: HWND,
     lbl_conn_row1: HWND,
     lbl_conn_row2: HWND,
+    lbl_conn_row3: HWND,
     lbl_up_row: HWND,
+    lbl_up_detail: HWND,
     lbl_down_row: HWND,
+    lbl_down_detail: HWND,
+
+    // Extended metrics
+    grp_bandwidth: HWND,
+    lbl_duplex_row: HWND,
+    lbl_nic_row: HWND,
+    lbl_rank_row: HWND,
+
+    // Chart
+    grp_chart: HWND,
 
     // Log group
     grp_log: HWND,
@@ -543,7 +569,6 @@ unsafe fn create_ctrl(
         Some(HMENU(id as *mut c_void))
     };
     let is_groupbox = (style & (BS_GROUPBOX as u32)) == (BS_GROUPBOX as u32);
-    // GroupBoxes must NOT set WS_CLIPSIBLINGS/WS_CLIPCHILDREN or they occlude inner controls.
     let final_style = if is_groupbox {
         style
     } else {
@@ -575,7 +600,7 @@ impl UiState {
         unsafe {
             set_font(self.lbl_title, t.font_title);
             set_font(self.lbl_status, t.font_bold);
-            set_font(self.lbl_mem_badge, t.font_ui);
+            set_font(self.lbl_mem_badge, t.font_small);
 
             set_font(self.grp_config, t.font_bold);
             set_font(self.lbl_streams, t.font_ui);
@@ -595,6 +620,7 @@ impl UiState {
             set_font(self.btn_conn, t.font_bold);
             set_font(self.btn_up, t.font_bold);
             set_font(self.btn_down, t.font_bold);
+            set_font(self.btn_duplex, t.font_bold);
             set_font(self.btn_stop, t.font_bold);
             set_font(self.btn_reset, t.font_ui);
             set_font(self.btn_clear_log, t.font_ui);
@@ -602,16 +628,25 @@ impl UiState {
 
             set_font(self.grp_metrics, t.font_bold);
             set_font(self.lbl_conn_row1, t.font_bold);
-            set_font(self.lbl_conn_row2, t.font_ui);
+            set_font(self.lbl_conn_row2, t.font_small);
+            set_font(self.lbl_conn_row3, t.font_small);
             set_font(self.lbl_up_row, t.font_ui);
+            set_font(self.lbl_up_detail, t.font_small);
             set_font(self.lbl_down_row, t.font_ui);
+            set_font(self.lbl_down_detail, t.font_small);
 
+            set_font(self.grp_bandwidth, t.font_bold);
+            set_font(self.lbl_duplex_row, t.font_bold);
+            set_font(self.lbl_nic_row, t.font_small);
+            set_font(self.lbl_rank_row, t.font_small);
+
+            set_font(self.grp_chart, t.font_bold);
             set_font(self.grp_log, t.font_bold);
             set_font(self.edit_log, t.font_log);
         }
     }
 
-    unsafe fn layout(&self, width: i32, height: i32) {
+    unsafe fn layout(&mut self, width: i32, height: i32) {
         let dpi = self.theme.dpi;
         let s = |px: i32| scale_px(px, dpi);
         let lh = self.theme.line_h;
@@ -620,15 +655,16 @@ impl UiState {
         let margin = s(14);
         let inner_pad = s(12);
         let gap = s(8);
-        let row_gap = s(7);
-        let w = (width - margin * 2).max(s(680));
+        let row_gap = s(6);
+        let w = (width - margin * 2).max(s(760));
 
         let row_h = lh + s(10);
+        let small_row_h = lh + s(6);
         let edit_h = lh + s(8);
         let multi_edit_h = lh * 3 + s(16);
         let btn_h = lh + s(16);
 
-        let mut hdwp = unsafe { BeginDeferWindowPos(40) };
+        let mut hdwp = unsafe { BeginDeferWindowPos(50) };
         let defer = |hdwp: &mut HDWP, hwnd: HWND, x: i32, y: i32, cx: i32, cy: i32| {
             if !hdwp.0.is_null() {
                 *hdwp = unsafe {
@@ -679,7 +715,7 @@ impl UiState {
         let mut y = s(10);
 
         // Top header bar
-        let title_w = (w * 54) / 100;
+        let title_w = (w * 52) / 100;
         let status_w = w - title_w - gap;
         let title_row_h = th + s(6);
         defer(&mut hdwp, self.lbl_title, margin, y, title_w, title_row_h);
@@ -703,7 +739,6 @@ impl UiState {
         let cfg_x = margin + inner_pad;
         let mut cy = cfg_top + cfg_title_offset;
 
-        // Config row 1: 3 numeric inputs + 1 continuous checkbox
         let lbl_s_w = s(136);
         let edt_s_w = s(56);
         let lbl_m_w = s(158);
@@ -731,7 +766,6 @@ impl UiState {
         defer(&mut hdwp, self.chk_continuous, rx, cy, chk_w, edit_h);
         cy += edit_h + row_gap;
 
-        // Target input rows with wide labels so Chinese text never truncates
         let target_lbl_w = s(188);
         let target_edt_w = (cfg_inner_w - target_lbl_w - gap).max(s(220));
         let target_edt_x = cfg_x + target_lbl_w + gap;
@@ -780,15 +814,16 @@ impl UiState {
         defer_bottom(&mut hdwp, self.grp_config, margin, cfg_top, w, cfg_h);
         y = cfg_top + cfg_h + s(10);
 
-        // Action buttons row (4 wider primary actions + 3 compact utility buttons)
+        // Action buttons row (8 buttons)
         let b_gap = s(6);
-        let avail = w - b_gap * 6;
-        let weights = [130, 130, 130, 115, 88, 88, 88];
+        let avail = w - b_gap * 7;
+        let weights = [118, 118, 118, 128, 112, 82, 82, 82];
         let total_w: i32 = weights.iter().sum();
         let btns = [
             self.btn_conn,
             self.btn_up,
             self.btn_down,
+            self.btn_duplex,
             self.btn_stop,
             self.btn_reset,
             self.btn_clear_log,
@@ -806,24 +841,56 @@ impl UiState {
         }
         y += btn_h + s(10);
 
-        // Group 2: Metrics (4 full-width clear rows)
+        // Group 2: Metrics (5 rows: conn1,2,3, up, down)
         let met_top = y;
-        let met_h = cfg_title_offset + row_h * 4 + s(10);
+        let met_h = cfg_title_offset + row_h + small_row_h * 2 + row_h * 2 + s(10);
         defer_bottom(&mut hdwp, self.grp_metrics, margin, met_top, w, met_h);
 
         let mut my = met_top + cfg_title_offset;
         defer(&mut hdwp, self.lbl_conn_row1, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
-        defer(&mut hdwp, self.lbl_conn_row2, cfg_x, my, cfg_inner_w, row_h);
-        my += row_h;
+        defer(&mut hdwp, self.lbl_conn_row2, cfg_x, my, cfg_inner_w, small_row_h);
+        my += small_row_h;
+        defer(&mut hdwp, self.lbl_conn_row3, cfg_x, my, cfg_inner_w, small_row_h);
+        my += small_row_h;
         defer(&mut hdwp, self.lbl_up_row, cfg_x, my, cfg_inner_w, row_h);
         my += row_h;
         defer(&mut hdwp, self.lbl_down_row, cfg_x, my, cfg_inner_w, row_h);
         y = met_top + met_h + s(10);
 
-        // Group 3: Log
+        // Group 3: Bandwidth detail (up_detail, down_detail, duplex, nic, rank)
+        let det_top = y;
+        let det_h = cfg_title_offset + row_h + small_row_h * 4 + s(10);
+        // Actually we have: up_detail (small), down_detail (small), duplex (bold), nic (small), rank (small) => 5 rows
+        defer_bottom(&mut hdwp, self.grp_bandwidth, margin, det_top, w, det_h);
+        let mut dy = det_top + cfg_title_offset;
+        defer(&mut hdwp, self.lbl_up_detail, cfg_x, dy, cfg_inner_w, small_row_h);
+        dy += small_row_h;
+        defer(&mut hdwp, self.lbl_down_detail, cfg_x, dy, cfg_inner_w, small_row_h);
+        dy += small_row_h;
+        defer(&mut hdwp, self.lbl_duplex_row, cfg_x, dy, cfg_inner_w, row_h);
+        dy += row_h;
+        defer(&mut hdwp, self.lbl_nic_row, cfg_x, dy, cfg_inner_w, small_row_h);
+        dy += small_row_h;
+        defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
+        y = det_top + det_h + s(10);
+
+        // Group 4: Chart
+        let chart_top = y;
+        let chart_h = s(160).max(lh * 8 + s(20));
+        defer_bottom(&mut hdwp, self.grp_chart, margin, chart_top, w, chart_h);
+        // Inner chart rect for GDI drawing
+        self.chart_rect = RECT {
+            left: cfg_x,
+            top: chart_top + cfg_title_offset,
+            right: cfg_x + cfg_inner_w,
+            bottom: chart_top + chart_h - s(8),
+        };
+        y = chart_top + chart_h + s(10);
+
+        // Group 5: Log
         let log_top = y;
-        let log_h = (height - log_top - s(12)).max(s(140));
+        let log_h = (height - log_top - s(12)).max(s(120));
         defer_bottom(&mut hdwp, self.grp_log, margin, log_top, w, log_h);
         defer(
             &mut hdwp,
@@ -889,12 +956,15 @@ impl UiState {
 
         TestConfig {
             stream_concurrency: streams,
+            up_concurrency: streams,
+            down_concurrency: streams,
             max_conn_cap,
             hold_secs,
             continuous_conn,
             tcp_targets,
             upload_targets,
             download_targets,
+            ..TestConfig::default()
         }
     }
 
@@ -908,6 +978,7 @@ impl UiState {
             let _ = unsafe { EnableWindow(self.btn_conn, !active) };
             let _ = unsafe { EnableWindow(self.btn_up, !active) };
             let _ = unsafe { EnableWindow(self.btn_down, !active) };
+            let _ = unsafe { EnableWindow(self.btn_duplex, !active) };
             let _ = unsafe { EnableWindow(self.btn_reset, !active) };
             let _ = unsafe { EnableWindow(self.btn_stop, active) };
             let _ = unsafe { InvalidateRect(Some(self.lbl_status), None, false) };
@@ -923,8 +994,10 @@ impl UiState {
 
         let sys_tcp = stats.sys_tcp_estab.load(Ordering::Relaxed);
         let handles = stats.proc_handles.load(Ordering::Relaxed);
+        let retrans_x100 = stats.tcp_retrans_pct_x100.load(Ordering::Relaxed);
+        let retrans_pct = (retrans_x100 as f64) / 100.0;
         let mem_badge = format!(
-            "纯内存运行保障：零配置落盘 · 零临时文件 · 零注册表写入  |  系统 TCP ESTABLISHED: {sys_tcp}  |  本进程句柄: {handles}"
+            "纯内存运行保障：零配置落盘 · 零临时文件 · 零注册表写入  |  系统 TCP ESTABLISHED: {sys_tcp}  |  本进程句柄: {handles}  |  TCP重传率: {retrans_pct:.2}%"
         );
         unsafe { set_cached_text(self.lbl_mem_badge, &mut self.cache.mem_badge, mem_badge) };
 
@@ -932,49 +1005,148 @@ impl UiState {
         let c_tgt = stats.conn_target_probe.load(Ordering::Relaxed);
         let c_peak = stats.conn_peak.load(Ordering::Relaxed);
         let c_stable = stats.conn_stable_max.load(Ordering::Relaxed);
+        let c_hold = stats.conn_long_hold_max.load(Ordering::Relaxed);
+        let hold_secs = stats.conn_hold_elapsed_secs.load(Ordering::Relaxed);
         let c_cps = stats.conn_per_sec.load(Ordering::Relaxed);
+        let cps_peak = stats.conn_cps_peak.load(Ordering::Relaxed);
         let c_rtt = stats.conn_rtt_ms.load(Ordering::Relaxed);
+        let orig_ok = stats.conn_orig_success.load(Ordering::Relaxed);
+        let orig_att = stats.conn_orig_attempts.load(Ordering::Relaxed);
+        let orig_pct = stats.orig_success_rate_pct();
+
         let conn_row1 = format!(
-            "[连接探测] 存活会话: {c_cur}  |  目标阶梯: {c_tgt}  |  峰值并发: {c_peak}  |  稳定上限: {c_stable}  |  建连速率: {c_cps}/s  |  握手延迟: {c_rtt} ms"
+            "[分级结果] 瞬时峰值: {c_peak} (建连峰值 {cps_peak}/s, 原始成功率 {orig_pct:.1}%)  |  稳定并发: {c_stable}  |  长时间保持: {c_hold} (持续 {hold_secs}s)"
         );
         unsafe { set_cached_text(self.lbl_conn_row1, &mut self.cache.conn_row1, conn_row1) };
 
-        let c_att = stats.conn_attempts.load(Ordering::Relaxed);
-        let c_rec = stats.conn_remote_closed.load(Ordering::Relaxed);
-        let f_to = stats.conn_fail_timeout.load(Ordering::Relaxed);
+        let rep_ok = stats.conn_replenish_success.load(Ordering::Relaxed);
+        let rep_att = stats.conn_replenish_attempts.load(Ordering::Relaxed);
+        let f_loc = stats.conn_fail_local.load(Ordering::Relaxed);
         let f_ref = stats.conn_fail_refused.load(Ordering::Relaxed);
-        let f_res = stats.conn_fail_resource.load(Ordering::Relaxed);
-        let f_oth = stats.conn_fail_other.load(Ordering::Relaxed);
+        let f_rem = stats.conn_remote_closed.load(Ordering::Relaxed);
+        let f_to = stats.conn_fail_timeout.load(Ordering::Relaxed);
         let conn_row2 = format!(
-            "[会话明细] 累计拨号: {c_att}  |  远端回收补建: {c_rec}  |  真实失败(超时:{f_to} / 拒绝:{f_ref} / 系统资源:{f_res} / 其他:{f_oth})"
+            "[连接归属] 存活: {c_cur} (目标:{c_tgt})  |  原始: {orig_ok}/{orig_att}  |  补建(不计入原始): {rep_ok}/{rep_att}  |  本机:{f_loc}  远拒:{f_ref}  远闭:{f_rem}  超时:{f_to}"
         );
         unsafe { set_cached_text(self.lbl_conn_row2, &mut self.cache.conn_row2, conn_row2) };
 
+        let t_healthy = stats.conn_targets_healthy.load(Ordering::Relaxed);
+        let t_total = stats.conn_targets_total.load(Ordering::Relaxed);
+        let wan_summary = stats.wan_distribution_summary();
+        let conn_row3 = format!(
+            "[WAN 分布] 健康目标: {t_healthy}/{t_total}  |  建连速率: {c_cps}/s  |  RTT: {c_rtt} ms  |  分流: {wan_summary}"
+        );
+        unsafe { set_cached_text(self.lbl_conn_row3, &mut self.cache.conn_row3, conn_row3) };
+
+        // Upload realtime
         let up_bps = stats.up_bps_current.load(Ordering::Relaxed);
         let up_peak = stats.up_bps_peak.load(Ordering::Relaxed);
+        let up_avg = stats.up_bps_avg.load(Ordering::Relaxed);
+        let up_p95 = stats.up_bps_p95.load(Ordering::Relaxed);
         let up_total = stats.up_bytes_total.load(Ordering::Relaxed);
         let up_streams = stats.up_active_streams.load(Ordering::Relaxed);
+        let up_cur_c = stats.up_current_concurrency.load(Ordering::Relaxed);
+        let up_best_c = stats.up_best_concurrency.load(Ordering::Relaxed);
         let up_err = stats.up_errors.load(Ordering::Relaxed);
+        let up_fail = stats.up_fail_rate_pct();
+        let up_lat = stats.up_latency_ms.load(Ordering::Relaxed);
         let up_row = format!(
-            "[上行压测] 实时速率: {}  |  峰值速率: {}  |  累计发送: {}  |  活跃流: {up_streams}  |  错误: {up_err}",
+            "[上行] 实时:{} 峰值:{} 平均:{} P95:{} | 并发:{up_cur_c}(最佳{up_best_c}) 活跃流:{up_streams} 失败率:{up_fail:.1}% 错误:{up_err}",
             format_mbps(up_bps),
             format_mbps(up_peak),
-            format_bytes(up_total),
+            format_mbps(up_avg),
+            format_mbps(up_p95),
         );
         unsafe { set_cached_text(self.lbl_up_row, &mut self.cache.up_row, up_row) };
 
+        let up_detail = format!(
+            "  └ 累计确认:{} | 延迟:{up_lat}ms | 重传:{retrans_pct:.2}% | NIC上行:{}",
+            format_bytes(up_total),
+            format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
+        );
+        unsafe { set_cached_text(self.lbl_up_detail, &mut self.cache.up_detail, up_detail) };
+
+        // Download realtime
         let down_bps = stats.down_bps_current.load(Ordering::Relaxed);
         let down_peak = stats.down_bps_peak.load(Ordering::Relaxed);
+        let down_avg = stats.down_bps_avg.load(Ordering::Relaxed);
+        let down_p95 = stats.down_bps_p95.load(Ordering::Relaxed);
         let down_total = stats.down_bytes_total.load(Ordering::Relaxed);
         let down_streams = stats.down_active_streams.load(Ordering::Relaxed);
+        let down_cur_c = stats.down_current_concurrency.load(Ordering::Relaxed);
+        let down_best_c = stats.down_best_concurrency.load(Ordering::Relaxed);
         let down_err = stats.down_errors.load(Ordering::Relaxed);
+        let down_fail = stats.down_fail_rate_pct();
+        let tcp_ms = stats.down_tcp_ms.load(Ordering::Relaxed);
+        let tls_ms = stats.down_tls_ms.load(Ordering::Relaxed);
+        let ttfb_ms = stats.down_ttfb_ms.load(Ordering::Relaxed);
         let down_row = format!(
-            "[下行压测] 实时速率: {}  |  峰值速率: {}  |  累计接收: {}  |  活跃流: {down_streams}  |  错误: {down_err}",
+            "[下行] 实时:{} 峰值:{} 平均:{} P95:{} | 并发:{down_cur_c}(最佳{down_best_c}) 活跃流:{down_streams} 失败率:{down_fail:.1}% 错误:{down_err}",
             format_mbps(down_bps),
             format_mbps(down_peak),
-            format_bytes(down_total),
+            format_mbps(down_avg),
+            format_mbps(down_p95),
         );
         unsafe { set_cached_text(self.lbl_down_row, &mut self.cache.down_row, down_row) };
+
+        let down_detail = format!(
+            "  └ 累计接收:{} | TCP:{tcp_ms}ms TLS:{tls_ms}ms TTFB:{ttfb_ms}ms | NIC下行:{}",
+            format_bytes(down_total),
+            format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
+        );
+        unsafe {
+            set_cached_text(
+                self.lbl_down_detail,
+                &mut self.cache.down_detail,
+                down_detail,
+            )
+        };
+
+        // Duplex combined
+        let duplex_text = if mode == AppMode::DuplexTesting {
+            let combined = up_bps + down_bps;
+            let combined_avg = stats.up_bps_avg.load(Ordering::Relaxed)
+                + stats.down_bps_avg.load(Ordering::Relaxed);
+            format!(
+                "[双向] 实时合计:{} (上{}+下{}) | 有效平均合计:{} | 应用↔网卡对比: 上行网卡{} 下行网卡{}",
+                format_mbps(combined),
+                format_mbps(up_bps),
+                format_mbps(down_bps),
+                format_mbps(combined_avg),
+                format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
+                format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
+            )
+        } else {
+            format!(
+                "[双向] 空闲 — 点击“双向同时压测”可同时跑满上行+下行 | 合计峰值: {}",
+                format_mbps(up_peak + down_peak)
+            )
+        };
+        unsafe { set_cached_text(self.lbl_duplex_row, &mut self.cache.duplex_row, duplex_text) };
+
+        // NIC
+        let nic_tx = stats.nic_tx_total.load(Ordering::Relaxed);
+        let nic_rx = stats.nic_rx_total.load(Ordering::Relaxed);
+        let nic_summary = stats.nic_summary.lock().clone();
+        let nic_row = format!(
+            "[网卡] 实时上行:{} 下行:{} | 累计发送:{} 接收:{} | 网卡:{}",
+            format_mbps(stats.nic_up_bps.load(Ordering::Relaxed)),
+            format_mbps(stats.nic_down_bps.load(Ordering::Relaxed)),
+            format_bytes(nic_tx),
+            format_bytes(nic_rx),
+            if nic_summary.is_empty() {
+                "检测中..."
+            } else {
+                &nic_summary
+            }
+        );
+        unsafe { set_cached_text(self.lbl_nic_row, &mut self.cache.nic_row, nic_row) };
+
+        // Node ranking
+        let up_rank = crate::state::SharedStats::node_ranking_summary(&stats.up_node_metrics);
+        let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
+        let rank_text = format!("[节点排名] 上行: {up_rank}  |  下行: {down_rank}");
+        unsafe { set_cached_text(self.lbl_rank_row, &mut self.cache.rank_row, rank_text) };
 
         // Delta-append memory ring buffer log
         let (new_gen, new_seq, lines, reset) = self.app.log.fetch_since(self.log_gen, self.log_seq);
@@ -1022,6 +1194,197 @@ impl UiState {
     }
 }
 
+/// Draw bandwidth chart inside given rect using GDI (caller provides HDC from BeginPaint)
+unsafe fn paint_speed_chart_on_hdc(hdc: HDC, chart_rect: RECT, stats: &crate::state::SharedStats, theme: &ThemeResources) {
+    let rc = chart_rect;
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    if w <= 20 || h <= 20 {
+        return;
+    }
+
+    // Create memory DC for double-buffer to avoid flicker
+    let mem_dc = unsafe { CreateCompatibleDC(Some(hdc)) };
+    let mem_bmp = unsafe { CreateCompatibleBitmap(hdc, w, h) };
+    if mem_dc.0.is_null() || mem_bmp.0.is_null() {
+        if !mem_dc.0.is_null() { let _ = unsafe { DeleteDC(mem_dc) }; }
+        if !mem_bmp.0.is_null() { let _ = unsafe { DeleteObject(HGDIOBJ(mem_bmp.0)) }; }
+        return;
+    }
+    let old_bmp = unsafe { SelectObject(mem_dc, HGDIOBJ(mem_bmp.0)) };
+
+    // Fill background with card color
+    let mut fill_rc = RECT { left: 0, top: 0, right: w, bottom: h };
+    let _ = unsafe { FillRect(mem_dc, &fill_rc, theme.brush_card) };
+
+    // Border
+    let pen_border = unsafe { CreatePen(PS_SOLID, 1, rgb(200, 200, 200)) };
+    let old_pen = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_border.0)) };
+    let old_brush = unsafe { SelectObject(mem_dc, HGDIOBJ(GetStockObject(NULL_BRUSH).0)) };
+    let _ = unsafe { Rectangle(mem_dc, 0, 0, w, h) };
+
+    // Chart inner area with padding for labels
+    let pad_l = scale_px(48, theme.dpi);
+    let pad_r = scale_px(10, theme.dpi);
+    let pad_t = scale_px(12, theme.dpi);
+    let pad_b = scale_px(18, theme.dpi);
+    let chart_l = pad_l;
+    let chart_t = pad_t;
+    let chart_r = w - pad_r;
+    let chart_b = h - pad_b;
+    let chart_w = (chart_r - chart_l).max(1);
+    let chart_h = (chart_b - chart_t).max(1);
+
+    // Determine max Y from history
+    let hist = stats.speed_history.lock().clone();
+    let mut max_bps: u64 = 10_000_000; // at least 10 Mbps visible
+    for pt in hist.iter() {
+        max_bps = max_bps.max(pt.up_bps).max(pt.down_bps).max(pt.nic_up_bps).max(pt.nic_down_bps);
+    }
+    max_bps = max_bps.max(stats.up_bps_peak.load(Ordering::Relaxed)).max(stats.down_bps_peak.load(Ordering::Relaxed));
+    max_bps = ((max_bps as f64) * 1.2) as u64;
+    if max_bps < 5_000_000 { max_bps = 5_000_000; }
+    let max_mbps = (max_bps as f64) / 1_000_000.0;
+
+    // Grid lines (4 horizontal)
+    let pen_grid = unsafe { CreatePen(PS_DOT, 1, rgb(220, 220, 220)) };
+    let _ = unsafe { SelectObject(mem_dc, HGDIOBJ(pen_grid.0)) };
+    for i in 1..4 {
+        let y = chart_t + (chart_h * i as i32) / 4;
+        let _ = unsafe { MoveToEx(mem_dc, chart_l, y, None) };
+        let _ = unsafe { LineTo(mem_dc, chart_r, y) };
+    }
+
+    // Y-axis labels
+    let _ = unsafe { SelectObject(mem_dc, HGDIOBJ(theme.font_small.0)) };
+    let _ = unsafe { SetBkMode(mem_dc, TRANSPARENT) };
+    let _ = unsafe { SetTextColor(mem_dc, theme.colors.text_muted) };
+    for i in 0..=4 {
+        let frac = (4 - i as i32) as f64 / 4.0;
+        let mbps = max_mbps * frac;
+        let label = if mbps >= 100.0 { format!("{mbps:.0}") } else { format!("{mbps:.1}") };
+        let y = chart_t + (chart_h * i as i32) / 4 - scale_px(6, theme.dpi);
+        let mut tr = RECT { left: scale_px(2, theme.dpi), top: y, right: pad_l - scale_px(2, theme.dpi), bottom: y + scale_px(14, theme.dpi) };
+        let wide = to_wide_null(&label);
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_RIGHT | DT_SINGLELINE) as u32) };
+    }
+    // X-axis time labels (0s .. 60s)
+    for i in 0..=3 {
+        let x = chart_l + (chart_w * i as i32) / 3;
+        let secs = (60 * i as i32) / 3;
+        let label = format!("{secs}s");
+        let wide = to_wide_null(&label);
+        let mut tr = RECT { left: x - scale_px(14, theme.dpi), top: chart_b + scale_px(2, theme.dpi), right: x + scale_px(14, theme.dpi), bottom: chart_b + scale_px(14, theme.dpi) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_CENTER | DT_SINGLELINE) as u32) };
+    }
+
+    // Helper to plot a series
+    let plot_series = |mem_dc: HDC, points: Vec<(f64,f64)>, color: COLORREF, width: i32, style: i32| {
+        if points.len() < 2 { return; }
+        let pen = unsafe { CreatePen(style, width, color) };
+        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
+        let mut first = true;
+        for (x_frac, y_frac) in points {
+            let x = chart_l + (chart_w as f64 * x_frac) as i32;
+            let y = chart_b - (chart_h as f64 * y_frac) as i32;
+            if first {
+                let _ = unsafe { MoveToEx(mem_dc, x, y, None) };
+                first = false;
+            } else {
+                let _ = unsafe { LineTo(mem_dc, x, y) };
+            }
+        }
+        let _ = unsafe { SelectObject(mem_dc, old) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(pen.0)) };
+    };
+
+    if !hist.is_empty() {
+        let max_f = max_bps as f64;
+
+        let up_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
+            let xf = (i as f64) / 119.0; // 120 points span
+            let yf = (pt.up_bps as f64) / max_f;
+            (xf, yf.clamp(0.0, 1.0))
+        }).collect();
+        let down_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
+            let xf = (i as f64) / 119.0;
+            let yf = (pt.down_bps as f64) / max_f;
+            (xf, yf.clamp(0.0, 1.0))
+        }).collect();
+        let nic_up_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
+            let xf = (i as f64) / 119.0;
+            let yf = (pt.nic_up_bps as f64) / max_f;
+            (xf, yf.clamp(0.0, 1.0))
+        }).collect();
+        let nic_down_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
+            let xf = (i as f64) / 119.0;
+            let yf = (pt.nic_down_bps as f64) / max_f;
+            (xf, yf.clamp(0.0, 1.0))
+        }).collect();
+
+        // Up: orange solid 2px
+        plot_series(mem_dc, up_pts, rgb(234, 88, 12), 2, PS_SOLID);
+        // Down: blue solid 2px
+        plot_series(mem_dc, down_pts, rgb(37, 99, 235), 2, PS_SOLID);
+        // Duplex combined: green if active (sum)
+        if stats.mode() == AppMode::DuplexTesting {
+            let duplex_pts: Vec<(f64,f64)> = hist.iter().enumerate().map(|(i, pt)| {
+                let xf = (i as f64) / 119.0;
+                let yf = ((pt.up_bps + pt.down_bps) as f64 / max_f).clamp(0.0, 1.0);
+                (xf, yf)
+            }).collect();
+            plot_series(mem_dc, duplex_pts, rgb(5, 122, 85), 2, PS_SOLID);
+        }
+        // NIC up: orange dashed
+        plot_series(mem_dc, nic_up_pts, rgb(180, 120, 40), 1, PS_DOT);
+        // NIC down: blue dashed
+        plot_series(mem_dc, nic_down_pts, rgb(100, 130, 180), 1, PS_DOT);
+    }
+
+    // Legend at top-right inside chart
+    let legend_items: Vec<(&str, COLORREF)> = vec![
+        ("上行", rgb(234,88,12)),
+        ("下行", rgb(37,99,235)),
+        ("双向合计", rgb(5,122,85)),
+        ("网卡上行(虚线)", rgb(180,120,40)),
+        ("网卡下行(虚线)", rgb(100,130,180)),
+    ];
+    let mut lx = chart_r - scale_px(260, theme.dpi);
+    let ly = chart_t + scale_px(4, theme.dpi);
+    for (label, color) in legend_items {
+        // color box
+        let pen = unsafe { CreatePen(PS_SOLID, 2, color) };
+        let old = unsafe { SelectObject(mem_dc, HGDIOBJ(pen.0)) };
+        let bx1 = lx;
+        let by1 = ly;
+        let bx2 = lx + scale_px(12, theme.dpi);
+        let by2 = ly + scale_px(4, theme.dpi);
+        let _ = unsafe { MoveToEx(mem_dc, bx1, (by1+by2)/2, None) };
+        let _ = unsafe { LineTo(mem_dc, bx2, (by1+by2)/2) };
+        let _ = unsafe { SelectObject(mem_dc, old) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(pen.0)) };
+        // text
+        let wide = to_wide_null(label);
+        let mut tr = RECT { left: bx2 + scale_px(4, theme.dpi), top: ly - scale_px(6, theme.dpi), right: bx2 + scale_px(60, theme.dpi), bottom: ly + scale_px(8, theme.dpi) };
+        let _ = unsafe { DrawTextW(mem_dc, PCWSTR(wide.as_ptr()), -1, &mut tr, (DT_LEFT | DT_SINGLELINE) as u32) };
+        lx += scale_px(52, theme.dpi);
+        if label.len() > 8 { lx += scale_px(20, theme.dpi); }
+    }
+
+    // Restore and blit
+    let _ = unsafe { SelectObject(mem_dc, old_pen) };
+    let _ = unsafe { SelectObject(mem_dc, old_brush) };
+    let _ = unsafe { DeleteObject(HGDIOBJ(pen_border.0)) };
+    let _ = unsafe { DeleteObject(HGDIOBJ(pen_grid.0)) };
+
+    // Blit to screen at chart_rect origin
+    let _ = unsafe { BitBlt(hdc, rc.left, rc.top, w, h, Some(mem_dc), 0, 0, SRCCOPY) };
+
+    let _ = unsafe { SelectObject(mem_dc, old_bmp) };
+    let _ = unsafe { DeleteObject(HGDIOBJ(mem_bmp.0)) };
+    let _ = unsafe { DeleteDC(mem_dc) };
+}
+
 pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String> {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1040,13 +1403,13 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: 0, // Avoid CS_HREDRAW | CS_VREDRAW to prevent resize flicker
+            style: 0,
             lpfnWndProc: Some(wnd_proc),
             hInstance: hinstance,
             hIcon: hicon_big,
             hIconSm: hicon_sm,
             hCursor: LoadCursorW(None, IDC_ARROW),
-            hbrBackground: HBRUSH(std::ptr::null_mut()), // Handled cleanly in WM_ERASEBKGND
+            hbrBackground: HBRUSH(std::ptr::null_mut()),
             lpszClassName: class_name,
             ..Default::default()
         };
@@ -1074,7 +1437,7 @@ pub fn run_gui(state: Arc<AppState>, engine: EngineHandle) -> Result<(), String>
         };
 
         let init_w = scale_px(1080, sys_dpi).min((screen_w * 92) / 100);
-        let init_h = scale_px(800, sys_dpi).min((screen_h * 90) / 100);
+        let init_h = scale_px(960, sys_dpi).min((screen_h * 92) / 100);
 
         let init_ctx = Box::new((state, engine));
         let raw_ctx = Box::into_raw(init_ctx);
@@ -1197,7 +1560,7 @@ unsafe extern "system" fn wnd_proc(
                     hwnd,
                     0,
                     hinst,
-                    theme.font_ui,
+                    theme.font_small,
                 )
             };
 
@@ -1417,6 +1780,18 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_bold,
                 )
             };
+            let btn_duplex = unsafe {
+                create_ctrl(
+                    w!("BUTTON"),
+                    "双向同时压测",
+                    btn_style,
+                    0,
+                    hwnd,
+                    ID_BTN_DUPLEX,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
             let btn_stop = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
@@ -1488,7 +1863,19 @@ unsafe extern "system" fn wnd_proc(
                     hwnd,
                     0,
                     hinst,
-                    theme.font_ui,
+                    theme.font_small,
+                )
+            };
+            let lbl_conn_row3 = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
                 )
             };
             let lbl_up_row = unsafe {
@@ -1503,6 +1890,18 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let lbl_up_detail = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
             let lbl_down_row = unsafe {
                 create_ctrl(
                     w!("STATIC"),
@@ -1515,10 +1914,86 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_ui,
                 )
             };
+            let lbl_down_detail = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
             let grp_metrics = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
                     " 实时测试指标监控 ",
+                    grp_style,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
+
+            // Bandwidth detail inner before group
+            let lbl_duplex_row = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
+            let lbl_nic_row = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
+            let lbl_rank_row = unsafe {
+                create_ctrl(
+                    w!("STATIC"),
+                    "",
+                    st_left,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_small,
+                )
+            };
+            let grp_bandwidth = unsafe {
+                create_ctrl(
+                    w!("BUTTON"),
+                    " 带宽详情 · 网卡对比 · 节点排名 ",
+                    grp_style,
+                    0,
+                    hwnd,
+                    0,
+                    hinst,
+                    theme.font_bold,
+                )
+            };
+
+            // Chart group (no inner text controls, painted via GDI)
+            let grp_chart = unsafe {
+                create_ctrl(
+                    w!("BUTTON"),
+                    " 实时速度曲线 (上行·下行·双向合计 vs 网卡实际流量) ",
                     grp_style,
                     0,
                     hwnd,
@@ -1563,6 +2038,7 @@ unsafe extern "system" fn wnd_proc(
                 last_mode_active: None,
                 log_gen: 0,
                 log_seq: 0,
+                chart_rect: RECT::default(),
                 lbl_title,
                 lbl_status,
                 lbl_mem_badge,
@@ -1583,6 +2059,7 @@ unsafe extern "system" fn wnd_proc(
                 btn_conn,
                 btn_up,
                 btn_down,
+                btn_duplex,
                 btn_stop,
                 btn_reset,
                 btn_clear_log,
@@ -1590,8 +2067,16 @@ unsafe extern "system" fn wnd_proc(
                 grp_metrics,
                 lbl_conn_row1,
                 lbl_conn_row2,
+                lbl_conn_row3,
                 lbl_up_row,
+                lbl_up_detail,
                 lbl_down_row,
+                lbl_down_detail,
+                grp_bandwidth,
+                lbl_duplex_row,
+                lbl_nic_row,
+                lbl_rank_row,
+                grp_chart,
                 grp_log,
                 edit_log,
             });
@@ -1613,8 +2098,8 @@ unsafe extern "system" fn wnd_proc(
                 96
             };
             let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize.x = scale_px(900, dpi);
-            mmi.ptMinTrackSize.y = scale_px(660, dpi);
+            mmi.ptMinTrackSize.x = scale_px(960, dpi);
+            mmi.ptMinTrackSize.y = scale_px(960, dpi);
             LRESULT(0)
         }
         m if m == WM_SYSCOLORCHANGE as u32 => {
@@ -1673,7 +2158,7 @@ unsafe extern "system" fn wnd_proc(
                     } else {
                         ui.theme.colors.active
                     }
-                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row2 {
+                } else if ctrl == ui.lbl_mem_badge || ctrl == ui.lbl_conn_row3 || ctrl == ui.lbl_nic_row || ctrl == ui.lbl_rank_row {
                     ui.theme.colors.text_muted
                 } else {
                     ui.theme.colors.text_primary
@@ -1694,6 +2179,20 @@ unsafe extern "system" fn wnd_proc(
                 return LRESULT(ui.theme.brush_card.0 as isize);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        m if m == WM_PAINT as u32 => {
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+            if !ptr.is_null() {
+                let ui = unsafe { &*ptr };
+                if ui.chart_rect.right > ui.chart_rect.left && ui.chart_rect.bottom > ui.chart_rect.top {
+                    unsafe { paint_speed_chart_on_hdc(hdc, ui.chart_rect, &ui.app.stats, &ui.theme) };
+                }
+            }
+            let _ = unsafe { EndPaint(hwnd, &ps) };
+            // Let child controls paint via DefWindowProc after we validated
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         m if m == WM_DPICHANGED as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
@@ -1723,10 +2222,11 @@ unsafe extern "system" fn wnd_proc(
         m if m == WM_SIZE as u32 => {
             let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
             if !ptr.is_null() {
-                let ui = unsafe { &*ptr };
+                let ui = unsafe { &mut *ptr };
                 let w = (lparam.0 & 0xFFFF) as i32;
                 let h = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 unsafe { ui.layout(w, h) };
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
             }
             LRESULT(0)
         }
@@ -1744,6 +2244,10 @@ unsafe extern "system" fn wnd_proc(
                 if !ptr.is_null() {
                     let ui = unsafe { &mut *ptr };
                     unsafe { ui.refresh_metrics_and_logs() };
+                    // Invalidate chart area to repaint curves each tick
+                    if ui.chart_rect.right > ui.chart_rect.left {
+                        let _ = unsafe { InvalidateRect(Some(hwnd), Some(&ui.chart_rect), false) };
+                    }
                 }
             }
             LRESULT(0)
@@ -1766,6 +2270,10 @@ unsafe extern "system" fn wnd_proc(
                         let cfg = unsafe { ui.read_config() };
                         ui.engine.start_download_test(cfg);
                     }
+                    ID_BTN_DUPLEX => {
+                        let cfg = unsafe { ui.read_config() };
+                        ui.engine.start_duplex_test(cfg);
+                    }
                     ID_BTN_STOP => {
                         ui.engine.stop();
                     }
@@ -1782,8 +2290,15 @@ unsafe extern "system" fn wnd_proc(
                     ID_BTN_HELP => {
                         let help_text = concat!(
                             "1. 纯内存原则：配置、统计和日志全部保存在进程内存中，退出即销毁，不读写本地磁盘或注册表。\n\n",
-                            "2. 并发连接数探测（参考路由器 WAN 探测原理）：先对目标节点执行并行预探测，剔除不可达端口或无效 IPv6；随后按令牌平滑建连并监控握手延迟 (RTT)，远端空闲断开自动补建而不计入本地失败；开启“持续加压”可在达到上限或稳定水位后持续维持与尝试向上探测。\n\n",
-                            "3. 上/下行带宽压测：下行流式拉取后直接在内存中丢弃；上行在内存中生成伪随机块推送，支持 HTTP POST 与 tcp://ip:port 裸流。"
+                            "2. 测速准确性：\n",
+                            "  · 上行严格区分【生成数据量/客户端发送量/服务端确认接收量】，仅服务端确认量计入有效速率；\n",
+                            "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
+                            "  · 失败请求独立统计，不计入成功率分母。\n\n",
+                            "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
+                            "4. 多 WAN 说明：单条 TCP 连接仅走单条出口，多目标并发才会分散至多条线路；本工具按独立 IP 列表原子轮询分散连接，并记录各 IP 连接数与速率，但不假设多 IP=多 WAN，需对照路由器/网卡实际流量验证。\n\n",
+                            "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
+                            "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 采样网卡收发字节、名称、状态、链路速率，对比应用流量与网卡总流量，并显示 TCP 重传率与 RTT/失败率。\n\n",
+                            "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
                         );
                         let wide = to_wide_null(help_text);
                         unsafe {

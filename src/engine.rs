@@ -1,6 +1,6 @@
 //! Background Tokio runtime & test lifecycle coordinator.
 //! Initializes the Tokio thread pool lazily in the background after the Win32 UI paints
-//! so application startup feels instantaneous.
+//! so application startup feels instantaneous. Supports duplex (up+down) simultaneous testing.
 
 use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
@@ -11,7 +11,7 @@ use tokio::runtime::Runtime;
 
 use crate::conn_tester::{CancelToken, run_conn_test};
 use crate::downloader::run_download_test;
-use crate::state::{AppMode, AppState, TestConfig};
+use crate::state::{AppMode, AppState, SpeedSamplePoint, TestConfig};
 use crate::sys_stats::query_sys_snapshot;
 use crate::uploader::run_upload_test;
 
@@ -62,10 +62,12 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_conn_run();
+        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_conn_rate_sampler(rt, &self.state, cancel.clone());
+        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_conn_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
@@ -83,10 +85,12 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_upload_run();
+        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Uploading, cancel.clone());
+        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_upload_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
@@ -104,14 +108,66 @@ impl EngineHandle {
             return false;
         };
         self.state.stats.reset_download_run();
+        self.state.stats.reset_speed_history();
         let cancel = self.install_cancel();
         let state = self.state.clone();
 
         Self::spawn_rate_sampler(rt, &self.state, AppMode::Downloading, cancel.clone());
+        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
         rt.spawn(async move {
             run_download_test(config, state.stats.clone(), state.log.clone(), cancel.clone()).await;
             cancel.cancel();
             state.stats.down_bps_current.store(0, Ordering::Relaxed);
+            state.stats.set_mode(AppMode::Idle);
+        });
+        true
+    }
+
+    pub fn start_duplex_test(&self, config: TestConfig) -> bool {
+        if !self.try_enter_mode(AppMode::DuplexTesting) {
+            return false;
+        }
+        let Some(rt) = self.runtime() else {
+            return false;
+        };
+        self.state.stats.reset_upload_run();
+        self.state.stats.reset_download_run();
+        self.state.stats.reset_speed_history();
+        let cancel = self.install_cancel();
+        let state = self.state.clone();
+
+        // Independent concurrency samplers for up and down; they share the same cancel token
+        // so a single Stop click cleans up both directions atomically.
+        Self::spawn_rate_sampler(rt, &self.state, AppMode::Uploading, cancel.clone());
+        Self::spawn_rate_sampler(rt, &self.state, AppMode::Downloading, cancel.clone());
+        Self::spawn_history_sampler(rt, &self.state, cancel.clone());
+
+        rt.spawn(async move {
+            let cfg_up = config.clone();
+            let cfg_down = config.clone();
+            let stats_up = state.stats.clone();
+            let stats_down = state.stats.clone();
+            let log_up = state.log.clone();
+            let log_down = state.log.clone();
+            let cancel_up = cancel.clone();
+            let cancel_down = cancel.clone();
+
+            let up_handle = tokio::spawn(async move {
+                run_upload_test(cfg_up, stats_up, log_up, cancel_up).await;
+            });
+            let down_handle = tokio::spawn(async move {
+                run_download_test(cfg_down, stats_down, log_down, cancel_down).await;
+            });
+
+            // Both tasks respect the shared cancel token; joining waits for natural
+            // completion or cancellation without double-moving JoinHandles.
+            let _ = tokio::join!(up_handle, down_handle);
+
+            // Ensure both counters are cleared after duplex
+            state.stats.up_bps_current.store(0, Ordering::Relaxed);
+            state.stats.down_bps_current.store(0, Ordering::Relaxed);
+            state.stats.up_active_streams.store(0, Ordering::Relaxed);
+            state.stats.down_active_streams.store(0, Ordering::Relaxed);
             state.stats.set_mode(AppMode::Idle);
         });
         true
@@ -174,6 +230,17 @@ impl EngineHandle {
                     _ => break,
                 };
 
+                // For duplex mode we still sample individually; the duplex spawn creates two samplers.
+                // If the current global mode is DuplexTesting, let both samplers run.
+                let current_mode = stats.mode();
+                if current_mode != mode && current_mode != AppMode::DuplexTesting {
+                    // Mode changed away from what we sample; continue but don't break immediately
+                    // to allow duplex coordination.
+                    if current_mode == AppMode::Idle {
+                        break;
+                    }
+                }
+
                 let delta = total.saturating_sub(last_bytes);
                 last_bytes = total;
                 last_time = now;
@@ -201,6 +268,27 @@ impl EngineHandle {
         });
     }
 
+    fn spawn_history_sampler(rt: &Runtime, state: &Arc<AppState>, cancel: Arc<CancelToken>) {
+        let stats = state.stats.clone();
+        rt.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_millis(500));
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                let pt = SpeedSamplePoint {
+                    up_bps: stats.up_bps_current.load(Ordering::Relaxed),
+                    down_bps: stats.down_bps_current.load(Ordering::Relaxed),
+                    nic_up_bps: stats.nic_up_bps.load(Ordering::Relaxed),
+                    nic_down_bps: stats.nic_down_bps.load(Ordering::Relaxed),
+                };
+                stats.push_speed_sample(pt);
+            }
+        });
+    }
+
     fn spawn_conn_rate_sampler(rt: &Runtime, state: &Arc<AppState>, cancel: Arc<CancelToken>) {
         let stats = state.stats.clone();
         rt.spawn(async move {
@@ -219,13 +307,15 @@ impl EngineHandle {
                 if secs <= 0.0 {
                     continue;
                 }
-                let total = stats.conn_established_total.load(Ordering::Relaxed);
+                let total = stats.conn_orig_success.load(Ordering::Relaxed)
+                    + stats.conn_replenish_success.load(Ordering::Relaxed);
                 let delta = total.saturating_sub(last_estab);
                 last_estab = total;
                 last_time = now;
 
                 let cps = ((delta as f64) / secs).round().max(0.0) as u64;
                 stats.conn_per_sec.store(cps, Ordering::Relaxed);
+                stats.update_cps_peak(cps);
             }
         });
     }
@@ -262,6 +352,23 @@ fn init_runtime_once<'a>(
                 stats_bg
                     .proc_handles
                     .store(snap.process_handles, Ordering::Relaxed);
+                stats_bg
+                    .tcp_retrans_pct_x100
+                    .store(snap.tcp_retrans_pct_x100, Ordering::Relaxed);
+                stats_bg.nic_up_bps.store(snap.nic_tx_bps, Ordering::Relaxed);
+                stats_bg
+                    .nic_down_bps
+                    .store(snap.nic_rx_bps, Ordering::Relaxed);
+                stats_bg
+                    .nic_tx_total
+                    .store(snap.nic_tx_bytes, Ordering::Relaxed);
+                stats_bg
+                    .nic_rx_total
+                    .store(snap.nic_rx_bytes, Ordering::Relaxed);
+                {
+                    let mut guard = stats_bg.nic_summary.lock();
+                    *guard = snap.nic_summary.clone();
+                }
             }
         });
 
