@@ -392,18 +392,38 @@ fn init_runtime_once<'a>(
                 "https://checkip.amazonaws.com",
                 "https://icanhazip.com",
                 "https://ifconfig.me/ip",
+                "https://ipinfo.io/ip",
+                "https://api64.ipify.org",
+                "https://ipv4.icanhazip.com",
+                "https://ipv6.icanhazip.com",
             ];
             loop {
-                let mut observations = Vec::new();
+                // Independent destinations can be routed through different WANs by
+                // destination-based load balancing. Do not reuse keep-alive sockets.
+                let mut probes = tokio::task::JoinSet::new();
                 for url in endpoints {
-                    let request = client.get(url).header(reqwest::header::CONNECTION, "close");
-                    if let Ok(Ok(resp)) = tokio::time::timeout(Duration::from_secs(4), request.send()).await {
-                        if let Ok(txt) = resp.text().await {
-                            if let Ok(ip) = txt.trim().parse::<std::net::IpAddr>() {
-                                let provider = url.split('/').nth(2).unwrap_or(url);
-                                observations.push(format!("{provider}={ip}"));
-                            }
-                        }
+                    let probe_client = client.clone();
+                    probes.spawn(async move {
+                        let request = probe_client
+                            .get(url)
+                            .header(reqwest::header::CONNECTION, "close");
+                        let response = tokio::time::timeout(
+                            Duration::from_secs(4),
+                            request.send(),
+                        )
+                        .await
+                        .ok()?
+                        .ok()?;
+                        let body = response.text().await.ok()?;
+                        let ip = body.trim().parse::<std::net::IpAddr>().ok()?;
+                        let provider = url.split('/').nth(2).unwrap_or(url);
+                        Some(format!("{provider}={ip}"))
+                    });
+                }
+                let mut observations = Vec::new();
+                while let Some(result) = probes.join_next().await {
+                    if let Ok(Some(observation)) = result {
+                        observations.push(observation);
                     }
                 }
                 if !observations.is_empty() {
