@@ -331,7 +331,7 @@ impl NodeSpeedMetrics {
             .fetch_add(elapsed_ms.max(1), Ordering::Relaxed);
         self.latency_cnt.fetch_add(1, Ordering::Relaxed);
 
-        let bps = ((confirmed_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
+        let bps = ((http_accepted_bytes as f64) * 8.0 * 1000.0 / (elapsed_ms.max(1) as f64)) as u64;
         let prev = self.ema_bps.load(Ordering::Relaxed);
         let next = if prev == 0 {
             bps
@@ -391,7 +391,7 @@ impl NodeSpeedMetrics {
 }
 
 #[derive(Debug, Clone)]
-pub struct WanRow {
+pub struct TargetDistributionRow {
     pub label: String,
     pub resolved: String,
     pub active: usize,
@@ -489,8 +489,8 @@ pub struct SharedStats {
     pub speed_history: Mutex<VecDeque<SpeedSamplePoint>>,
 
     // WAN egress public IP auto-detected
-    pub wan_public_ip: Mutex<String>,
-    pub wan_last_update_ms: AtomicU64,
+    pub egress_ip_observations: Mutex<String>,
+    pub egress_ip_last_update_ms: AtomicU64,
 }
 
 impl Default for SharedStats {
@@ -557,8 +557,8 @@ impl Default for SharedStats {
             nic_rx_total: AtomicU64::new(0),
             nic_summary: Mutex::new("网卡检测中...".to_string()),
             speed_history: Mutex::new(VecDeque::with_capacity(120)),
-            wan_public_ip: Mutex::new("检测中...".to_string()),
-            wan_last_update_ms: AtomicU64::new(0),
+            egress_ip_observations: Mutex::new("等待探测".to_string()),
+            egress_ip_last_update_ms: AtomicU64::new(0),
         }
     }
 }
@@ -735,7 +735,7 @@ impl SharedStats {
         }
     }
 
-    pub fn wan_distribution_summary(&self) -> String {
+    pub fn target_distribution_summary(&self) -> String {
         let guard = self.target_metrics.lock();
         let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
         if healthy.is_empty() {
@@ -766,13 +766,13 @@ impl SharedStats {
     }
 
     /// Vertical WAN rows: one per healthy target, sorted by active desc, with share %
-    pub fn wan_vertical_rows(&self) -> Vec<WanRow> {
+    pub fn target_distribution_rows(&self) -> Vec<TargetDistributionRow> {
         let guard = self.target_metrics.lock();
         let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
         if healthy.is_empty() {
             return Vec::new();
         }
-        let total_peak: usize = healthy.iter().map(|t| t.peak_conns.load(Ordering::Relaxed)).sum::<usize>().max(1);
+        let total_active: usize = healthy.iter().map(|t| t.active_conns.load(Ordering::Relaxed)).sum();
         let mut sorted = healthy;
         sorted.sort_by(|a,b| b.active_conns.load(Ordering::Relaxed).cmp(&a.active_conns.load(Ordering::Relaxed)));
         sorted.iter().take(8).map(|t| {
@@ -780,8 +780,8 @@ impl SharedStats {
             let peak = t.peak_conns.load(Ordering::Relaxed);
             let pct = t.orig_success_rate_pct();
             let rtt = t.avg_rtt_ms();
-            let share = (peak as f64)*100.0/(total_peak as f64);
-            WanRow {
+            let share = if total_active == 0 { 0.0 } else { (act as f64) * 100.0 / total_active as f64 };
+            TargetDistributionRow {
                 label: t.label.clone(),
                 resolved: t.resolved_addr.clone(),
                 active: act,
