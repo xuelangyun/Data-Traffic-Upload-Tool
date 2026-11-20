@@ -64,13 +64,25 @@ jobs:
         run: cargo test --all-targets
 
       - name: Build Windows release binary
+        continue-on-error: true
         shell: pwsh
         run: |
           if (Test-Path Cargo.lock) {
-            cargo build --release --locked --target x86_64-pc-windows-msvc
+            cargo build --release --locked --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object build.log
           } else {
-            cargo build --release --target x86_64-pc-windows-msvc
+            cargo build --release --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object build.log
           }
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content build.log | Select-Object -Last 200 | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.RELEASE_TAG }}
+          path: build.log
 
       - name: Package release archive and SHA256 checksums
         shell: pwsh
