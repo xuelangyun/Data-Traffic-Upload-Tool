@@ -16,13 +16,26 @@ www.baidu.com:80, www.baidu.com:443, www.qq.com:80, www.qq.com:443, \
 www.aliyun.com:443, www.taobao.com:443, www.163.com:80, www.jd.com:443, www.bilibili.com:443";
 
 pub const DEFAULT_DOWNLOAD_TARGETS: &str = "\
-https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
-https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
+https://test.nju.edu.cn/backend/garbage.php?ckSize=100\r\n\
+http://speed.neu.edu.cn/fastgarbage.php?ckSize=100\r\n\
+https://iptv.tsinghua.edu.cn/st/garbage.php?ckSize=100\r\n\
+https://speed.nuaa.edu.cn/backend/garbage.php?ckSize=100\r\n\
 https://mirrors.aliyun.com/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
 https://mirrors.cloud.tencent.com/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
-https://speed.cloudflare.com/__down?bytes=104857600";
+https://mirrors.bfsu.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
+https://mirrors.tuna.tsinghua.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso\r\n\
+https://mirrors.ustc.edu.cn/archlinux/iso/latest/archlinux-x86_64.iso";
 
-pub const DEFAULT_UPLOAD_TARGETS: &str = "https://speed.cloudflare.com/__up";
+pub const DEFAULT_UPLOAD_TARGETS: &str = "\
+https://arms-retcode.aliyuncs.com/r.png, \
+https://snowflake.qq.com/, \
+https://gatherer.m.qq.com/, \
+https://galileotelemetry.tencent.com/collect, \
+https://test.nju.edu.cn/backend/empty.php, \
+http://speed.neu.edu.cn/empty.php, \
+https://iptv.tsinghua.edu.cn/st/empty.php, \
+https://speed.nuaa.edu.cn/backend/empty.php, \
+https://speed.cloudflare.com/__up";
 
 pub const DEFAULT_STREAM_CONCURRENCY: usize = 16;
 pub const DEFAULT_MAX_CONNS_CAP: usize = 30_000;
