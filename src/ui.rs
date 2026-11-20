@@ -939,7 +939,7 @@ impl UiState {
         defer(&mut hdwp, self.lbl_rank_row, cfg_x, dy, cfg_inner_w, small_row_h);
         y = det_top + det_h + s(6);
 
-        // Group 4: WAN port mapping table (all four configured ports have fixed-width rows)
+        // Group 4: detected WAN egress public IP table (fixed-width rows)
         let wan_top = y;
         let wan_title_offset = lh + s(6);
         let target_table_height = wan_title_offset + small_row_h * (2 + MAX_EGRESS_IP_ROWS as i32) + s(6);
@@ -2496,7 +2496,7 @@ unsafe extern "system" fn wnd_proc(
                             "  · 下行分离 TCP建连/TLS握手/TTFB/纯传输时间，预测仅基于纯传输阶段，多轮中位数选优；\n",
                             "  · 失败请求独立统计，不计入成功率分母。\n\n",
                             "3. 自动并发寻优：档位 1/2/4/8/16/32/64 基于速率、失败率、延迟自动搜索最佳稳定并发，非固定 16。\n\n",
-                            "4. WAN 出口公网 IP：程序并行访问多个独立公网 IP 查询服务，将返回的公网出口 IP 去重后按出口地址分组显示。每个不同公网 IP 代表本轮探测观察到的一种出口身份；命中数表示有多少探测服务看到了该 IP，不是带宽占比。出口编号仅用于列表展示，不等同于路由器物理 WAN1/WAN2 端口编号。\\n\\n",
+                            "4. WAN 出口公网 IP：程序并行访问多个独立公网 IP 查询服务，将返回的公网出口 IP 去重后按出口地址分组显示。每个不同公网 IP 代表本轮探测观察到的一种出口身份；命中数表示有多少探测服务看到了该 IP，不是带宽占比。出口编号仅用于列表展示，不等同于路由器物理 WAN1/WAN2 端口编号。\n\n",
                             "5. 双向压测：上传与下载可同时满载，独立并发与统计，实时合计吞吐直接可见。\n\n",
                             "6. 网卡监控：每 500ms 通过 GetIfTable2/MIB_IF_ROW2 汇总物理网卡流量并排除虚拟接口；系统 IPv4 TCP 重传率按采样增量计算。\n\n",
                             "7. 报告以有效窗口平均吞吐为主，峰值/P95/累计流量/并发/失败率等为辅；速度曲线实时展示 60 秒历史。"
