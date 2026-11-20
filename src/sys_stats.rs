@@ -211,7 +211,7 @@ mod win_imp {
         };
 
         // Build human-readable summary
-        rows.sort_by(|a, b| b.1.saturating_add(b.2).cmp(&a.1.saturating_add(&a.2)));
+        rows.sort_by(|a, b| b.1.saturating_add(b.2).cmp(&a.1.saturating_add(a.2)));
         let mut parts: Vec<String> = Vec::new();
         for (name, _tx, _rx, link) in rows.iter().take(3) {
             let link_str = if *link >= 1_000_000 {
