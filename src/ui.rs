@@ -1,6 +1,6 @@
 //! Native Win32 GUI with zero-flicker GDI rendering, Per-Monitor DPI scaling,
 //! Windows system style & font adaptation, connection/bandwidth tables and
-//! source-IP grouped egress distribution.
+//! dynamically expanding public egress-IP columns.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -34,6 +34,9 @@ const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_REPLACESEL: u32 = 0x00C2;
 const EM_SETLIMITTEXT: u32 = 0x00C5;
 const LVM_DELETEITEM_MSG: u32 = 0x1008; // LVM_FIRST + 8
+const LVM_SETCOLUMN_MSG: u32 = 0x101A; // LVM_FIRST + 26
+const LVM_DELETECOLUMN_MSG: u32 = 0x101C; // LVM_FIRST + 28
+const LVM_SETCOLUMNWIDTH_MSG: u32 = 0x101E; // LVM_FIRST + 30
 
 const fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(((b as u32) << 16) | ((g as u32) << 8) | (r as u32))
@@ -57,7 +60,9 @@ struct LabelCache {
     // Table caches: keep last rendered cell to avoid flicker
     metrics_cells: [[String; 6]; 8],
     bandwidth_cells: [[String; 6]; 4],
-    wan_cells: Vec<[String; 3]>,
+    wan_columns: Vec<String>,
+    // Two fixed data rows; each row has one cache cell per visible column.
+    wan_cells: Vec<Vec<String>>,
 }
 
 struct SystemColors {
@@ -509,7 +514,6 @@ struct UiState {
     last_mode_active: Option<bool>,
     log_gen: u64,
     log_seq: u64,
-    wan_layout_rows: usize,
 
     // Header
     lbl_title: HWND,
@@ -627,6 +631,46 @@ unsafe fn lv_insert_column(hwnd: HWND, idx: i32, title: &str, width: i32, fmt: i
         ..Default::default()
     };
     let _ = unsafe { SendMessageW(hwnd, LVM_INSERTCOLUMNW as u32, WPARAM(idx as usize), LPARAM(&mut col as *mut _ as isize)) };
+}
+
+unsafe fn lv_set_column_title(hwnd: HWND, idx: i32, title: &str) {
+    let mut wide = to_wide_null(title);
+    let mut col = LVCOLUMNW {
+        mask: LVCF_TEXT as u32,
+        pszText: PWSTR(wide.as_mut_ptr()),
+        cchTextMax: wide.len() as i32,
+        ..Default::default()
+    };
+    let _ = unsafe {
+        SendMessageW(
+            hwnd,
+            LVM_SETCOLUMN_MSG,
+            WPARAM(idx as usize),
+            LPARAM(&mut col as *mut _ as isize),
+        )
+    };
+}
+
+unsafe fn lv_delete_column(hwnd: HWND, idx: i32) {
+    let _ = unsafe {
+        SendMessageW(
+            hwnd,
+            LVM_DELETECOLUMN_MSG,
+            WPARAM(idx as usize),
+            LPARAM(0),
+        )
+    };
+}
+
+unsafe fn lv_set_column_width(hwnd: HWND, idx: i32, width: i32) {
+    let _ = unsafe {
+        SendMessageW(
+            hwnd,
+            LVM_SETCOLUMNWIDTH_MSG,
+            WPARAM(idx as usize),
+            LPARAM(width.max(24) as isize),
+        )
+    };
 }
 
 unsafe fn lv_insert_row(hwnd: HWND, row: i32) {
@@ -858,12 +902,12 @@ impl UiState {
         defer_bottom(&mut hdwp, self.grp_bandwidth, margin, bw_top, w, bw_h);
         defer(&mut hdwp, self.lv_bandwidth, cfg_x, bw_top + metrics_title_off, cfg_inner_w, bw_h - metrics_title_off - s(4));
         y = bw_top + bw_h + s(6);
-        // WAN table: grow vertically with the number of unique public egress IPs.
+        // WAN table keeps two data rows; each detected public IP expands horizontally as a column.
         let wan_top = y;
-        let wan_rows = self.wan_layout_rows.max(1) as i32;
-        let wan_h = metrics_title_off + small_row_h + s(22) + wan_rows * small_row_h + s(8);
+        let wan_data_rows = 2;
+        let wan_h = metrics_title_off + small_row_h + s(22) + wan_data_rows * small_row_h + s(8);
         defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, wan_h);
-        // Inside WAN: lbl_wan_ip small row at top of inner area, then ListView occupies rest
+        // Inside WAN: summary label first, then the IP-per-column ListView.
         let wan_inner_y = wan_top + metrics_title_off;
         defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wan_inner_y, cfg_inner_w, small_row_h);
         defer(&mut hdwp, self.lv_wan, cfg_x, wan_inner_y + small_row_h + s(2), cfg_inner_w, wan_h - metrics_title_off - small_row_h - s(6));
@@ -1133,7 +1177,7 @@ impl UiState {
             set_lv_cell(lv, 3, 5, &mut self.cache.bandwidth_cells[3][5], format!("上行 {} · 下行 {}", up_rank, down_rank));
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(1), LPARAM(0)) };
         }
-        // Group the latest external reflector responses by their observed public egress IP.
+        // Group external reflector responses by their observed public egress IP.
         let wan_age = {
             let last = stats.egress_ip_last_update_ms.load(Ordering::Relaxed);
             if last == 0 {
@@ -1151,51 +1195,119 @@ impl UiState {
         let wan_rows = stats.egress_ip_rows();
         let probe_hits: usize = wan_rows.iter().map(|row| row.hits).sum();
         let wan_summary = format!(
-            "发现 {} 个公网 IP · {} 次服务响应 · {}",
+            "发现 {} 个不同公网 IP · {} 次服务响应 · {}",
             wan_rows.len(),
             probe_hits,
             wan_age
         );
         unsafe { set_cached_text(self.lbl_wan_ip, &mut self.cache.wan_ip, wan_summary) };
 
-        let desired_rows = wan_rows.len().max(1);
         {
             let lv = self.lv_wan;
             let _ = unsafe { SendMessageW(lv, WM_SETREDRAW as u32, WPARAM(0), LPARAM(0)) };
 
-            // Dynamic ListView items: one row per unique public egress IP.
-            while self.cache.wan_cells.len() < desired_rows {
+            // The first column labels the metric. Every public IP gets its own dynamic column.
+            let desired_columns = wan_rows.len().max(1) + 1;
+            while self.cache.wan_columns.len() < desired_columns {
+                let col_idx = self.cache.wan_columns.len();
+                let title = if wan_rows.is_empty() && col_idx == 1 {
+                    "等待探测"
+                } else {
+                    "公网 IP"
+                };
+                unsafe {
+                    lv_insert_column(lv, col_idx as i32, title, scale_px(220, self.theme.dpi), LVCFMT_CENTER as i32)
+                };
+                self.cache.wan_columns.push(title.to_string());
+            }
+            while self.cache.wan_columns.len() > desired_columns {
+                let col_idx = self.cache.wan_columns.len() - 1;
+                unsafe { lv_delete_column(lv, col_idx as i32) };
+                self.cache.wan_columns.pop();
+            }
+
+            let mut titles = Vec::with_capacity(desired_columns);
+            titles.push("项目".to_string());
+            if wan_rows.is_empty() {
+                titles.push("等待探测".to_string());
+            } else {
+                titles.extend(wan_rows.iter().map(|row| row.ip.clone()));
+            }
+            for (col_idx, title) in titles.iter().enumerate() {
+                if self.cache.wan_columns[col_idx] != *title {
+                    unsafe { lv_set_column_title(lv, col_idx as i32, title) };
+                    self.cache.wan_columns[col_idx] = title.clone();
+                }
+            }
+
+            // Exactly two fixed metric rows: hit count and provider sources.
+            while self.cache.wan_cells.len() < 2 {
                 let row_idx = self.cache.wan_cells.len();
                 unsafe { lv_insert_row(lv, row_idx as i32) };
-                self.cache.wan_cells.push(std::array::from_fn(|_| String::new()));
+                self.cache.wan_cells.push(vec![String::new(); desired_columns]);
             }
-            while self.cache.wan_cells.len() > desired_rows {
+            while self.cache.wan_cells.len() > 2 {
                 let row_idx = self.cache.wan_cells.len() - 1;
                 unsafe { lv_delete_row(lv, row_idx as i32) };
                 self.cache.wan_cells.pop();
             }
+            for row_cache in &mut self.cache.wan_cells {
+                row_cache.resize(desired_columns, String::new());
+            }
+
+            let labels = ["命中服务", "探测来源"];
+            for (row_idx, label) in labels.iter().enumerate() {
+                set_lv_cell(
+                    lv,
+                    row_idx as i32,
+                    0,
+                    &mut self.cache.wan_cells[row_idx][0],
+                    (*label).to_string(),
+                );
+            }
 
             if wan_rows.is_empty() {
-                let values = ["等待公网 IP 探测", "-", "查询服务暂不可用时保留上次成功结果"];
-                for (col, value) in values.iter().enumerate() {
-                    set_lv_cell(lv, 0, col as i32, &mut self.cache.wan_cells[0][col], (*value).to_string());
-                }
+                set_lv_cell(lv, 0, 1, &mut self.cache.wan_cells[0][1], "-".to_string());
+                set_lv_cell(
+                    lv,
+                    1,
+                    1,
+                    &mut self.cache.wan_cells[1][1],
+                    "等待公网 IP 查询服务响应".to_string(),
+                );
             } else {
                 for (idx, row) in wan_rows.iter().enumerate() {
-                    let values = [
-                        row.ip.clone(),
-                        format!("{} 个", row.hits),
+                    let col_idx = idx + 1;
+                    set_lv_cell(
+                        lv,
+                        0,
+                        col_idx as i32,
+                        &mut self.cache.wan_cells[0][col_idx],
+                        format!("{} 个服务", row.hits),
+                    );
+                    set_lv_cell(
+                        lv,
+                        1,
+                        col_idx as i32,
+                        &mut self.cache.wan_cells[1][col_idx],
                         row.providers.join(" · "),
-                    ];
-                    for (col, value) in values.iter().enumerate() {
-                        set_lv_cell(
-                            lv,
-                            idx as i32,
-                            col as i32,
-                            &mut self.cache.wan_cells[idx][col],
-                            value.clone(),
-                        );
-                    }
+                    );
+                }
+            }
+
+            // Keep a useful minimum width per IP; extra columns become horizontally scrollable.
+            let mut client_rect = RECT::default();
+            let _ = unsafe { GetClientRect(lv, &mut client_rect) };
+            let client_width = (client_rect.right - client_rect.left).max(0);
+            let label_width = (client_width * 16 / 100)
+                .clamp(scale_px(88, self.theme.dpi), scale_px(140, self.theme.dpi));
+            let ip_column_count = desired_columns.saturating_sub(1).max(1) as i32;
+            let ip_width = ((client_width - label_width) / ip_column_count)
+                .max(scale_px(220, self.theme.dpi));
+            unsafe {
+                lv_set_column_width(lv, 0, label_width);
+                for col_idx in 1..desired_columns {
+                    lv_set_column_width(lv, col_idx as i32, ip_width);
                 }
             }
 
@@ -1747,11 +1859,12 @@ unsafe extern "system" fn wnd_proc(
             let lv_wan = unsafe { create_listview(hwnd, hinst, theme.font_small) };
             unsafe {
                 let total_w = 860;
-                lv_insert_column(lv_wan, 0, "公网出口 IP", total_w*22/100, LVCFMT_LEFT as i32);
-                lv_insert_column(lv_wan, 1, "命中服务", total_w*14/100, LVCFMT_CENTER as i32);
-                lv_insert_column(lv_wan, 2, "探测来源", total_w*64/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 0, "项目", total_w*16/100, LVCFMT_LEFT as i32);
+                lv_insert_column(lv_wan, 1, "等待探测", total_w*84/100, LVCFMT_CENTER as i32);
+                lv_insert_row(lv_wan, 0);
+                lv_insert_row(lv_wan, 1);
             }
-            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 公网出口 IP（相同 IP 合并） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
+            let grp_wan = unsafe { create_ctrl(w!("BUTTON"), " 多 WAN 公网出口 IP（一个 IP 一列，可横向滚动） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold) };
 
             // Inner control for Log (created BEFORE grp_log)
             let edit_log = unsafe {
@@ -1782,8 +1895,12 @@ unsafe extern "system" fn wnd_proc(
 
             let mut ui = Box::new(UiState {
                 app, engine, theme,
-                cache: LabelCache::default(),
-                last_mode_active: None, log_gen: 0, log_seq: 0, wan_layout_rows: 1,
+                cache: LabelCache {
+                    wan_columns: vec!["项目".to_string(), "等待探测".to_string()],
+                    wan_cells: vec![vec![String::new(); 2]; 2],
+                    ..LabelCache::default()
+                },
+                last_mode_active: None, log_gen: 0, log_seq: 0,
                 lbl_title, lbl_status, lbl_mem_badge,
                 grp_config, lbl_streams, edit_streams, lbl_max_conns, edit_max_conns, lbl_hold_secs, edit_hold_secs, chk_continuous,
                 lbl_tcp_targets, edit_tcp_targets, lbl_up_targets, edit_up_targets, lbl_down_targets, edit_down_targets,
@@ -1942,13 +2059,7 @@ unsafe extern "system" fn wnd_proc(
                 let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut UiState;
                 if !ptr.is_null() {
                     let ui = unsafe { &mut *ptr };
-                    let next_wan_rows = ui.app.stats.egress_ip_rows().len().max(1);
-                    if next_wan_rows != ui.wan_layout_rows {
-                        ui.wan_layout_rows = next_wan_rows;
-                        let mut client_rect = RECT::default();
-                        let _ = unsafe { GetClientRect(hwnd, &mut client_rect) };
-                        unsafe { ui.layout(client_rect.right - client_rect.left, client_rect.bottom - client_rect.top) };
-                    }
+                    // WAN columns expand/collapse inside the ListView; panel layout stays fixed.
                     unsafe { ui.refresh_metrics_and_logs() };
                 }
             }
@@ -1993,7 +2104,7 @@ unsafe extern "system" fn wnd_proc(
                         let help_text = concat!(
                             "纯内存运行：测试配置、统计和日志仅保存在进程内存。\n\n",
                             "实时速率：按最近约 1 秒应用层字节增量计算。上传实时值是请求体交给 HTTP 客户端的速率，累计有效量只计完整请求返回 HTTP 2xx；下行按实际读取字节计算。\n\n",
-                            "多 WAN：并行查询多个公网 IP 服务，按返回的公网出口 IP 合并显示，列出命中的服务；支持 IPv4/IPv6。探测结果用于识别出口 IP，不代表物理 WAN 口或带宽占比。\n\n",
+                            "多 WAN：并行查询多个公网 IP 服务，每个不同公网出口 IP 单独占一列，动态增减列并显示命中服务；列数超出窗口宽度时可横向滚动。支持 IPv4/IPv6。探测结果用于识别出口 IP，不代表物理 WAN 口或带宽占比。\n\n",
                             "仅对自己拥有或已获授权的目标进行连接和带宽测试。"
                         );
                         let wide = to_wide_null(help_text);
