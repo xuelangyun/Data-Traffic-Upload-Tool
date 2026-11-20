@@ -139,9 +139,6 @@ impl ThemeResources {
         let font_mono = unsafe {
             CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
         };
-        let font_mono = unsafe {
-            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
-        };
         let colors = unsafe { SystemColors::query() };
         let brush_bg = unsafe { CreateSolidBrush(colors.bg) };
         let brush_card = unsafe { CreateSolidBrush(colors.card) };
@@ -171,10 +168,12 @@ impl ThemeResources {
             delete_font(&mut self.font_log);
             delete_font(&mut self.font_small);
             delete_font(&mut self.font_mono);
-            delete_font(&mut self.font_mono);
         }
         let (font_title, font_ui, font_bold, font_log, font_small, line_h, title_h) =
             unsafe { create_font_bundle(safe_dpi) };
+        let font_mono = unsafe {
+            CreateFontIndirectW(&make_logfont("Consolas", 8, FW_NORMAL, safe_dpi as i32))
+        };
         self.dpi = safe_dpi;
         self.font_title = font_title;
         self.font_ui = font_ui;
@@ -205,6 +204,7 @@ impl ThemeResources {
             delete_font(&mut self.font_bold);
             delete_font(&mut self.font_log);
             delete_font(&mut self.font_small);
+            delete_font(&mut self.font_mono);
             if !self.brush_bg.0.is_null() {
                 let _ = DeleteObject(HGDIOBJ(self.brush_bg.0));
                 self.brush_bg = HBRUSH(std::ptr::null_mut());
@@ -968,14 +968,14 @@ impl UiState {
         // Group 4: remote target distribution table (all rows are included in layout height)
         let wan_top = y;
         let wan_title_offset = lh + s(6);
-        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_TARGET_ROWS as i32) + s(6);
+        let target_table_height = wan_title_offset + small_row_h * (2 + MAX_WAN_PORTS as i32) + s(6);
         defer_bottom(&mut hdwp, self.grp_wan, margin, wan_top, w, target_table_height);
         let mut wy = wan_top + wan_title_offset;
         defer(&mut hdwp, self.lbl_wan_ip, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
         defer(&mut hdwp, self.lbl_wan_header, cfg_x, wy, cfg_inner_w, small_row_h);
         wy += small_row_h;
-        for i in 0..MAX_TARGET_ROWS {
+        for i in 0..MAX_WAN_PORTS {
             defer(&mut hdwp, self.wan_rows[i], cfg_x, wy, cfg_inner_w, small_row_h);
             wy += small_row_h;
         }
@@ -2189,8 +2189,8 @@ unsafe extern "system" fn wnd_proc(
                     theme.font_small,
                 )
             };
-            let mut wan_rows: [HWND; MAX_WAN_PORTS] = [HWND(std::ptr::null_mut()); 8];
-            for i in 0..8 {
+            let mut wan_rows: [HWND; MAX_WAN_PORTS] = [HWND(std::ptr::null_mut()); MAX_WAN_PORTS];
+            for i in 0..MAX_WAN_PORTS {
                 wan_rows[i] = unsafe {
                     create_ctrl(
                         w!("STATIC"),
@@ -2207,7 +2207,7 @@ unsafe extern "system" fn wnd_proc(
             let grp_wan = unsafe {
                 create_ctrl(
                     w!("BUTTON"),
-                    " 远端目标连接分布（不代表物理 WAN 线路） ",
+                    " WAN 口公网 IP 对应（请填写每条 WAN 的公网 IP） ",
                     grp_style,
                     0,
                     hwnd,
