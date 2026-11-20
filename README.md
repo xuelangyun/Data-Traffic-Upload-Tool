@@ -15,6 +15,11 @@
    - **持续上行带宽压测 (`BandwidthUploader`)**：支持 HTTP/HTTPS POST 流式上传与 413 自适应请求体缩小；只统计完整请求体提交后收到 2xx 的 HTTP 接受量，不将其称为逐字节服务端 ACK。
    - **持续下行带宽压测 (`BandwidthDownloader`)**：多流并发请求公网大文件/测速流，收到的数据块直接在内存中丢弃并统计实时/峰值 Mbps 与累计流量。
 
+## Windows 程序图标
+
+- 正式 EXE 使用 `build.rs` 生成的多分辨率网络测速图标（16/32/48/128 px），包含测速表盘、上行指针和网络地球元素。
+- Windows MSVC 构建通过 Windows SDK `rc.exe` 将图标作为 PE 资源嵌入；若图标资源无法编译，构建会直接失败，不再静默退回默认图标。
+
 ## 软件截图
 
 > 主界面真实运行截图待补充。请使用 Windows 实际运行程序后截图，并保存为 `docs/images/winnetstress-main.png`；收到截图素材后即可在此处嵌入，避免用示意图代替真实界面。

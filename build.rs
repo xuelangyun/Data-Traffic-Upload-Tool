@@ -41,7 +41,7 @@ fn main() {
 
         // Compile custom multi-resolution .ico into the executable if rc.exe is available.
         let ico_path = out_dir.join("win_net_stress.ico");
-        let ico_bytes = build_multi_res_ico(&[16, 32, 48]);
+        let ico_bytes = build_multi_res_ico(&[16, 32, 48, 128]);
         fs::write(&ico_path, ico_bytes).expect("failed to write compile-time ico");
 
         let rc_path = out_dir.join("win_net_stress.rc");
@@ -52,17 +52,19 @@ fn main() {
         );
         fs::write(&rc_path, rc_content).expect("failed to write compile-time rc");
 
-        if let Some(rc_exe) = find_rc_exe() {
-            let ok = Command::new(rc_exe)
-                .args(["/nologo", "/fo"])
-                .arg(&res_path)
-                .arg(&rc_path)
-                .status()
-                .is_ok_and(|s| s.success());
-            if ok && res_path.exists() {
-                println!("cargo:rustc-link-arg-bins={}", res_path.display());
-            }
+        let rc_exe = find_rc_exe().unwrap_or_else(|| {
+            panic!("Windows SDK rc.exe was not found; cannot embed the WinNetStress icon")
+        });
+        let status = Command::new(&rc_exe)
+            .args(["/nologo", "/fo"])
+            .arg(&res_path)
+            .arg(&rc_path)
+            .status()
+            .unwrap_or_else(|e| panic!("failed to run {}: {e}", rc_exe.display()));
+        if !status.success() || !res_path.is_file() {
+            panic!("rc.exe failed to compile the WinNetStress icon resource");
         }
+        println!("cargo:rustc-link-arg-bins={}", res_path.display());
     }
 }
 
@@ -205,51 +207,98 @@ fn render_icon_bgra(size: usize) -> Vec<[u8; 4]> {
 }
 
 fn sample_icon_pixel(u: f32, v: f32) -> [f32; 4] {
-    // Rounded-square SDF
-    let half = 0.88f32;
-    let rad = 0.26f32;
-    let qx = u.abs() - (half - rad);
-    let qy = v.abs() - (half - rad);
-    let sdf = (qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)) - rad;
-    if sdf > 0.03 {
+    // Deep-blue rounded square background.
+    let half = 0.90f32;
+    let radius = 0.25f32;
+    let qx = u.abs() - (half - radius);
+    let qy = v.abs() - (half - radius);
+    let sdf = (qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0)) - radius;
+    if sdf > 0.035 {
         return [0.0, 0.0, 0.0, 0.0];
     }
-    let badge_alpha = ((-sdf + 0.03) / 0.06).clamp(0.0, 1.0);
+    let alpha = ((-sdf + 0.035) / 0.07).clamp(0.0, 1.0);
+    let t = ((u + v + 1.9) / 3.8).clamp(0.0, 1.0);
+    let color = [
+        0.015 * (1.0 - t) + 0.025 * t,
+        0.28 * (1.0 - t) + 0.10 * t,
+        0.68 * (1.0 - t) + 0.36 * t,
+        alpha,
+    ];
 
-    // Rich azure-to-deep-navy diagonal gradient
-    let t = ((u + v + 1.8) / 3.6).clamp(0.0, 1.0);
-    let mut r = 0.02 * (1.0 - t) + 0.06 * t;
-    let mut g = 0.52 * (1.0 - t) + 0.24 * t;
-    let mut b = 0.82 * (1.0 - t) + 0.52 * t;
-
-    // Subtle crisp inner border ring
-    if sdf > -0.055 {
-        r = r * 0.72 + 0.55 * 0.28;
-        g = g * 0.72 + 0.85 * 0.28;
-        b = b * 0.72 + 1.00 * 0.28;
+    // Thin luminous speedometer arc across the top half.
+    let gauge_y = -0.08;
+    let gauge_r = 0.66;
+    let gauge_dist = (u.hypot(v - gauge_y) - gauge_r).abs();
+    let gauge_angle = (v - gauge_y).atan2(u);
+    if gauge_angle > -2.78 && gauge_angle < -0.36 && gauge_dist < 0.045 {
+        return [0.40, 0.88, 1.0, alpha];
     }
 
-    // Outer open speed-gauge arc
-    let dist = u.hypot(v);
-    let angle = v.atan2(u);
-    let in_arc = !(angle > 0.72 && angle < 2.42);
-    if in_arc && (dist - 0.62).abs() < 0.055 {
-        return [0.85, 0.95, 1.0, badge_alpha];
+    // Gauge ticks.
+    for angle in [-2.58f32, -2.08, -1.57, -1.06, -0.56] {
+        let (sin_a, cos_a) = angle.sin_cos();
+        let outer = gauge_r + 0.02;
+        let inner = gauge_r - 0.09;
+        if segment_distance(u, v, cos_a * inner, gauge_y + sin_a * inner,
+                            cos_a * outer, gauge_y + sin_a * outer) < 0.022 {
+            return [0.78, 0.94, 1.0, alpha];
+        }
     }
 
-    // Left upward arrow (Upload - crisp white)
-    let up_shaft = (u + 0.19).abs() < 0.075 && v > -0.20 && v < 0.36;
-    let up_head = (-0.44..=-0.10).contains(&v) && (u + 0.19).abs() <= (v + 0.44) * 0.78 + 0.02;
-    if up_shaft || up_head {
-        return [1.0, 1.0, 1.0, badge_alpha];
+    // Cyan speed needle / forward arrow.
+    let shaft = segment_distance(u, v, 0.00, -0.05, 0.43, -0.49);
+    let head_a = segment_distance(u, v, 0.43, -0.49, 0.26, -0.45);
+    let head_b = segment_distance(u, v, 0.43, -0.49, 0.39, -0.31);
+    if shaft < 0.052 || head_a < 0.052 || head_b < 0.052 {
+        return [0.30, 0.94, 1.0, alpha];
     }
 
-    // Right downward arrow (Download - bright cyan)
-    let dn_shaft = (u - 0.19).abs() < 0.075 && v > -0.36 && v < 0.20;
-    let dn_head = (0.10..=0.44).contains(&v) && (u - 0.19).abs() <= (0.44 - v) * 0.78 + 0.02;
-    if dn_shaft || dn_head {
-        return [0.49, 0.89, 1.0, badge_alpha];
+    // Network globe centered in the lower half.
+    let globe_y = 0.23;
+    let globe_r = 0.52;
+    let globe_d = u.hypot(v - globe_y);
+    if (globe_d - globe_r).abs() < 0.040 {
+        return [0.93, 0.98, 1.0, alpha];
     }
 
-    [r, g, b, badge_alpha]
+    // Vertical meridian and curved longitude lines.
+    let yn = ((v - globe_y) / globe_r).clamp(-1.0, 1.0);
+    if yn.abs() < 0.96 && u.abs() < 0.030 {
+        return [0.78, 0.92, 1.0, alpha];
+    }
+    let meridian_span = (1.0 - yn * yn).max(0.0).sqrt();
+    for bend in [-0.48f32, 0.48] {
+        let x = bend * globe_r * meridian_span;
+        if yn.abs() < 0.90 && (u - x).abs() < 0.026 {
+            return [0.78, 0.92, 1.0, alpha];
+        }
+    }
+
+    // Two latitude lines.
+    for offset in [-0.22f32, 0.22] {
+        let width = (globe_r * globe_r - offset * offset).sqrt();
+        if (v - (globe_y + offset)).abs() < 0.025 && u.abs() < width {
+            return [0.78, 0.92, 1.0, alpha];
+        }
+    }
+
+    // Cyan network nodes on the globe perimeter.
+    for (nx, ny) in [(-0.50f32, 0.23f32), (0.50, 0.23), (0.0, 0.73)] {
+        if (u - nx).hypot(v - ny) < 0.055 {
+            return [0.30, 0.94, 1.0, alpha];
+        }
+    }
+
+    color
+}
+
+fn segment_distance(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let length_sq = dx * dx + dy * dy;
+    if length_sq <= f32::EPSILON {
+        return (px - ax).hypot(py - ay);
+    }
+    let t = (((px - ax) * dx + (py - ay) * dy) / length_sq).clamp(0.0, 1.0);
+    (px - (ax + t * dx)).hypot(py - (ay + t * dy))
 }
