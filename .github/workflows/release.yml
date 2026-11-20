@@ -60,21 +60,21 @@ jobs:
           Write-Host "Asset Prefix: $assetPrefix"
 
       - name: Run unit tests
-        continue-on-error: true
         run: cargo test --all-targets
 
       - name: Build Windows release binary
-        continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           if (Test-Path Cargo.lock) {
-            cargo build --release --locked --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object build.log
+            cargo build --release --locked --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object -FilePath build.log
           } else {
-            cargo build --release --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object build.log
+            cargo build --release --target x86_64-pc-windows-msvc --verbose 2>&1 | Tee-Object -FilePath build.log
           }
-          if ($LASTEXITCODE -ne 0) {
+          $buildExitCode = $LASTEXITCODE
+          if ($buildExitCode -ne 0) {
             Get-Content build.log | Select-Object -Last 200 | ForEach-Object { Write-Host "::error::$_" }
-            exit 1
+            exit $buildExitCode
           }
 
       - name: Upload build log on failure
@@ -85,53 +85,42 @@ jobs:
           path: build.log
 
       - name: Package release archive and SHA256 checksums
-        continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $distDir = "dist"
-          $bundleDir = "$distDir/bundle"
+          $bundleDir = Join-Path $distDir "bundle"
           New-Item -ItemType Directory -Force -Path $bundleDir | Out-Null
 
-          Write-Host "Listing target dirs for debug:"
-          Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
           $srcExe = "target/x86_64-pc-windows-msvc/release/win_net_stress.exe"
-          if (-not (Test-Path $srcExe)) {
-            Write-Host "Not found at $srcExe, trying fallback"
-            $srcExe = "target/release/win_net_stress.exe"
+          if (-not (Test-Path -LiteralPath $srcExe -PathType Leaf)) {
+            throw "Release binary missing. The Windows build must succeed before packaging: $srcExe"
           }
-          Write-Host "Using srcExe=$srcExe TestPath=$((Test-Path $srcExe))"
-          if (-not (Test-Path $srcExe)) {
-            Write-Host "Searching for any win_net_stress.exe under target:"
-            $found = Get-ChildItem -Path "target" -Recurse -Filter "win_net_stress.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($found) {
-              $srcExe = $found.FullName
-              Write-Host "Found via search: $srcExe"
-            } else {
-              Write-Host "Dir listing target:"
-              Get-ChildItem -Path "target" -Directory | ForEach-Object { Write-Host $_.Name }
-              if (Test-Path "target/x86_64-pc-windows-msvc") { Get-ChildItem -Path "target/x86_64-pc-windows-msvc" -Directory | ForEach-Object { Write-Host "x86_64 subdir $($_.Name)" } }
-              throw "Compiled binary not found: $srcExe"
+          if ((Get-Item -LiteralPath $srcExe).Length -le 0) {
+            throw "Release binary is empty: $srcExe"
+          }
+
+          $outExe = Join-Path $distDir "$($env:ASSET_PREFIX).exe"
+          $outZip = Join-Path $distDir "$($env:ASSET_PREFIX).zip"
+          Copy-Item -LiteralPath $srcExe -Destination $outExe -Force
+          Copy-Item -LiteralPath $srcExe -Destination (Join-Path $bundleDir "win_net_stress.exe") -Force
+          Copy-Item -LiteralPath "README.md" -Destination (Join-Path $bundleDir "README.md") -Force
+          Compress-Archive -Path (Join-Path $bundleDir "*") -DestinationPath $outZip -Force
+
+          foreach ($file in @($outExe, $outZip)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -le 0) {
+              throw "Expected release asset was not created: $file"
             }
           }
 
-          $outExe = "$distDir/${env:ASSET_PREFIX}.exe"
-          $outZip = "$distDir/${env:ASSET_PREFIX}.zip"
-
-          Copy-Item $srcExe $outExe -Force
-          Copy-Item $srcExe "$bundleDir/win_net_stress.exe" -Force
-          Copy-Item "README.md" "$bundleDir/README.md" -Force
-
-          Compress-Archive -Path "$bundleDir/*" -DestinationPath $outZip -Force
-
           $hashes = @()
           foreach ($file in @($outExe, $outZip)) {
-            $h = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
-            $name = Split-Path -Leaf $file
-            $hashes += "$h  $name"
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $hashes += "$hash  $(Split-Path -Leaf $file)"
           }
-          $hashes | Out-File -FilePath "$distDir/SHA256SUMS.txt" -Encoding ascii
-          Get-Content "$distDir/SHA256SUMS.txt"
-
+          $hashFile = Join-Path $distDir "SHA256SUMS.txt"
+          $hashes | Out-File -FilePath $hashFile -Encoding ascii
+          Get-Content $hashFile
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -140,8 +129,10 @@ jobs:
             dist/*.zip
             dist/*.exe
             dist/SHA256SUMS.txt
+          if-no-files-found: error
 
       - name: Create GitHub Release
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
