@@ -1019,7 +1019,6 @@ impl UiState {
         let ttfb_ms = stats.down_ttfb_ms.load(Ordering::Relaxed);
         let up_rank = crate::state::SharedStats::node_ranking_summary(&stats.up_node_metrics);
         let down_rank = crate::state::SharedStats::node_ranking_summary(&stats.down_node_metrics);
-        let wan_ip_raw = stats.egress_ip_observations.lock().clone();
 
         // Helper to update ListView cell with cache check (prevent jitter)
         let mut set_lv_cell = |hwnd: HWND, row: i32, col: i32, cache: &mut String, next: String| {
@@ -1745,7 +1744,7 @@ unsafe extern "system" fn wnd_proc(
                 create_ctrl(w!("BUTTON"), " 宽带详情（近1秒速率） ", grp_style, 0, hwnd, 0, hinst, theme.font_bold)
             };
 
-            let lbl_wan_ip = unsafe { create_ctrl(w!("STATIC"), "出口公网IP: 检测中...", st_left, 0, hwnd, 0, hinst, theme.font_small) };
+            let lbl_wan_ip = unsafe { create_ctrl(w!("STATIC"), "公网出口 IP 探测中...", st_left, 0, hwnd, 0, hinst, theme.font_small) };
             let lv_wan = unsafe { create_listview(hwnd, hinst, theme.font_small) };
             unsafe {
                 let total_w = 860;
