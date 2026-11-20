@@ -93,6 +93,9 @@ jobs:
 
           $srcExe = "target/x86_64-pc-windows-msvc/release/win_net_stress.exe"
           if (-not (Test-Path $srcExe)) {
+            $srcExe = "target/release/win_net_stress.exe"
+          }
+          if (-not (Test-Path $srcExe)) {
             throw "Compiled binary not found: $srcExe"
           }
 
