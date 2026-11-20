@@ -42,7 +42,7 @@ https://galileotelemetry.tencent.com/collect";
 pub const DEFAULT_STREAM_CONCURRENCY: usize = 16;
 pub const DEFAULT_MAX_CONNS_CAP: usize = 30_000;
 pub const DEFAULT_HOLD_SECS: u64 = 3;
-pub const DEFAULT_TEST_DURATION_SECS: u64 = 60;
+pub const DEFAULT_TEST_DURATION_SECS: u64 = 0;
 pub const DEFAULT_WARMUP_SECS: u64 = 5;
 pub const DEFAULT_HTTP_POST_BYTES: usize = 4 * 1024 * 1024;
 pub const CONCURRENCY_TIERS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -390,6 +390,17 @@ impl NodeSpeedMetrics {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct WanRow {
+    pub label: String,
+    pub resolved: String,
+    pub active: usize,
+    pub peak: usize,
+    pub pct: f64,
+    pub rtt: u64,
+    pub share: f64,
+}
+
 /// Rolling speed sample for Win32 GDI charts (500ms per point, up to 120 points = 60s).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpeedSamplePoint {
@@ -477,6 +488,10 @@ pub struct SharedStats {
 
     // Chart history (up to 120 points = 60s at 500ms)
     pub speed_history: Mutex<VecDeque<SpeedSamplePoint>>,
+
+    // WAN egress public IP auto-detected
+    pub wan_public_ip: Mutex<String>,
+    pub wan_last_update_ms: AtomicU64,
 }
 
 impl Default for SharedStats {
@@ -545,6 +560,8 @@ impl Default for SharedStats {
             nic_rx_total: AtomicU64::new(0),
             nic_summary: Mutex::new("网卡检测中...".to_string()),
             speed_history: Mutex::new(VecDeque::with_capacity(120)),
+            wan_public_ip: Mutex::new("检测中...".to_string()),
+            wan_last_update_ms: AtomicU64::new(0),
         }
     }
 }
@@ -751,6 +768,34 @@ impl SharedStats {
             parts.push(format!("等{}个节点", sorted.len()));
         }
         parts.join(" · ")
+    }
+
+    /// Vertical WAN rows: one per healthy target, sorted by active desc, with share %
+    pub fn wan_vertical_rows(&self) -> Vec<WanRow> {
+        let guard = self.target_metrics.lock();
+        let healthy: Vec<&Arc<TargetMetrics>> = guard.iter().filter(|t| t.healthy).collect();
+        if healthy.is_empty() {
+            return Vec::new();
+        }
+        let total_peak: usize = healthy.iter().map(|t| t.peak_conns.load(Ordering::Relaxed)).sum::<usize>().max(1);
+        let mut sorted = healthy;
+        sorted.sort_by(|a,b| b.active_conns.load(Ordering::Relaxed).cmp(&a.active_conns.load(Ordering::Relaxed)));
+        sorted.iter().take(8).map(|t| {
+            let act = t.active_conns.load(Ordering::Relaxed);
+            let peak = t.peak_conns.load(Ordering::Relaxed);
+            let pct = t.orig_success_rate_pct();
+            let rtt = t.avg_rtt_ms();
+            let share = (peak as f64)*100.0/(total_peak as f64);
+            WanRow {
+                label: t.label.clone(),
+                resolved: t.resolved_addr.clone(),
+                active: act,
+                peak,
+                pct,
+                rtt,
+                share,
+            }
+        }).collect()
     }
 
     pub fn node_ranking_summary(nodes: &Mutex<Vec<Arc<NodeSpeedMetrics>>>) -> String {
