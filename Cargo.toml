@@ -17,6 +17,10 @@ futures-core = "0.3"
 windows = { git = "https://github.com/microsoft/windows-rs", tag = "74", features = [
     "iphlpapi",
     "libloaderapi",
+    "netioapi",
+    "ifdef",
+    "ipifcons",
+    "ntddndis",
     "processthreadsapi",
     "sysinfoapi",
     "wingdi",
